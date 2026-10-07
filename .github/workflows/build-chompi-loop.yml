@@ -1,28 +1,62 @@
 # Builds CHOMPI_LOOP.bin in the cloud whenever the mod files change.
 # Lives at .github/workflows/build-chompi-loop.yml in your fork.
 #
-# How it works: takes the stock TEMPO firmware from firmware/chompi-tempo,
-# drops the looper files from mods/chompi-loop/src on top, builds with the
-# compiler TEMPO needs (Arm GNU Toolchain 13.3.rel1), and offers the .bin
-# as a download on the run's page (Actions tab -> the run -> Artifacts).
+# How it works: finds the looper files wherever they were uploaded (normally
+# mods/chompi-loop/src), takes the stock TEMPO firmware from firmware/chompi-tempo,
+# drops the looper files on top, builds with the compiler TEMPO needs
+# (Arm GNU Toolchain 13.3.rel1), and offers the .bin as a download on the run's
+# page (Actions tab -> the run -> Artifacts).
 
 name: Build CHOMPI LOOP
 
 on:
   push:
     paths:
-      - 'mods/chompi-loop/**'
+      - 'mods/**'
+      - '**/LoopCore.h'
+      - '**/NoteLooper.h'
       - '.github/workflows/build-chompi-loop.yml'
   workflow_dispatch: # adds a "Run workflow" button on the Actions tab
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Get the code
         uses: actions/checkout@v4
         with:
           lfs: true # harmless if the repo doesn't use Git LFS
+
+      - name: Find the looper files
+        run: |
+          # Wherever the upload put them: the folder that holds LoopCore.h
+          # (ignoring the stock firmware folders).
+          LOOPCORE=$(git ls-files | grep -E '(^|/)LoopCore\.h$' | grep -v '^firmware/' | head -n 1)
+          if [ -z "$LOOPCORE" ]; then
+            echo "::error::Couldn't find LoopCore.h in the repo. Upload the mods folder from the download."
+            echo "Files outside firmware/ in this repo:"
+            git ls-files | grep -v '^firmware/' | head -n 100
+            exit 1
+          fi
+          SRC=$(dirname "$LOOPCORE")
+          echo "Looper files found in: $SRC"
+          ls -la "$SRC"
+
+          MISSING=""
+          for f in LoopCore.h NoteLooper.h clockManager.h chompi_main.cpp ui.h NormalPage.h MenuPage.h MidiManager.h OptionsManager.h; do
+            [ -f "$SRC/$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::These looper files are missing from $SRC:$MISSING"
+            exit 1
+          fi
+
+          TEST=$(git ls-files | grep -E '(^|/)test_loopcore\.cpp$' | head -n 1)
+          echo "LOOPER_SRC=$SRC" >> "$GITHUB_ENV"
+          echo "LOOPER_TEST=$TEST" >> "$GITHUB_ENV"
 
       - name: Install Arm GNU Toolchain 13.3.rel1
         run: |
@@ -37,8 +71,16 @@ jobs:
         run: arm-none-eabi-gcc --version
 
       - name: Test the looper logic
-        working-directory: mods/chompi-loop/src/tests
         run: |
+          if [ -z "$LOOPER_TEST" ]; then
+            echo "::warning::test_loopcore.cpp wasn't uploaded, so the looper tests were skipped."
+            exit 0
+          fi
+          # Run the tests from a scratch copy, so it works however the files were uploaded
+          rm -rf test-area && mkdir -p test-area/tests
+          cp "$LOOPER_SRC/LoopCore.h" test-area/
+          cp "$LOOPER_TEST" test-area/tests/
+          cd test-area/tests
           g++ -std=c++17 -Wall -Wextra -O1 -o test_loopcore test_loopcore.cpp
           ./test_loopcore
 
@@ -47,7 +89,8 @@ jobs:
           rm -rf build-area
           mkdir build-area
           cp -r firmware/chompi-tempo build-area/chompi-loop
-          cp -r mods/chompi-loop/src/. build-area/chompi-loop/code/src/
+          find "$LOOPER_SRC" -maxdepth 1 -type f \( -name '*.h' -o -name '*.cpp' \) ! -name 'test_loopcore.cpp' \
+            -exec cp -v {} build-area/chompi-loop/code/src/ \;
 
       - name: Build libDaisy / DaisySP if they aren't prebuilt
         working-directory: build-area/chompi-loop/code/libs
@@ -71,3 +114,4 @@ jobs:
         with:
           name: CHOMPI_LOOP
           path: build-area/chompi-loop/code/src/build/CHOMPI_LOOP.bin
+          if-no-files-found: error
