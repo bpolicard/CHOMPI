@@ -43,7 +43,7 @@ FileStreamingManager file_manager;
 ArpeggiatorSequencer arpSeq;
 clockManager cManager;
 MidiManager midi;
-NoteLooper looper;
+NoteLooper noteLooper;
 granularDelay delay;
 StateSaver stateSaver;
 BaseEngine* engines[2] = { &sEngine, &slice };
@@ -123,7 +123,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         arpSeq.setClockEdge(1);
     }
     cManager.checkIntervalExpired(2);
-    looper.Process(); // before the engines' Prepare() so looper notes start this block
+    noteLooper.Process(); // before the engines' Prepare() so looper notes start this block
     arpSeq.Prepare();
     for (size_t i = 0; i < kNumEngines; ++i) {
         engines[i]->Prepare();
@@ -176,7 +176,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 void MidiClockCallback(void* ctx)
 {
     // Called at the timer frequency
-    if (looper.IsRunning() && options.midi_clock_out && cManager.getClockMode() == FREE) {
+    if (noteLooper.IsRunning() && options.midi_clock_out && cManager.getClockMode() == FREE) {
         midi.QueueMidiClock();
     }
     cManager.incrementCounters();
@@ -410,14 +410,14 @@ int main(void)
 
     InitMidiClockTimer();
     cManager.Init(&midi_clock_timer, tim_base_freq);
-    looper.Init(engines, &hw, &cManager, &options);
+    noteLooper.Init(engines, &hw, &cManager, &options);
     LedSetup();
     ui.Init(&fx, &cManager, &arpSeq, &sManager, &hw, &presets, options.pitch_shift_quantization, 
         engines, &stateSaver, &options);
 
     arpSeq.Init(engines, &cManager, &hw, &options);
-    ui.SetLooper(&looper);
-    midi.SetLooper(&looper);
+    ui.SetLooper(&noteLooper);
+    midi.SetLooper(&noteLooper);
     hw.setMidiCCOut(options.midi_cc_out);
     midi.setMidiOptions(options.midi_ch_in, options.midi_cc_in, options.transport_type);
 
