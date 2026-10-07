@@ -1,0 +1,73 @@
+# Builds CHOMPI_LOOP.bin in the cloud whenever the mod files change.
+# Lives at .github/workflows/build-chompi-loop.yml in your fork.
+#
+# How it works: takes the stock TEMPO firmware from firmware/chompi-tempo,
+# drops the looper files from mods/chompi-loop/src on top, builds with the
+# compiler TEMPO needs (Arm GNU Toolchain 13.3.rel1), and offers the .bin
+# as a download on the run's page (Actions tab -> the run -> Artifacts).
+
+name: Build CHOMPI LOOP
+
+on:
+  push:
+    paths:
+      - 'mods/chompi-loop/**'
+      - '.github/workflows/build-chompi-loop.yml'
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+        with:
+          lfs: true # harmless if the repo doesn't use Git LFS
+
+      - name: Install Arm GNU Toolchain 13.3.rel1
+        run: |
+          URL=https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-arm-none-eabi.tar.xz
+          MIRROR=https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-arm-none-eabi.tar.xz
+          curl -fsSL "$URL" -o toolchain.tar.xz || curl -fsSL "$MIRROR" -o toolchain.tar.xz
+          mkdir -p "$HOME/arm-toolchain"
+          tar -xf toolchain.tar.xz -C "$HOME/arm-toolchain" --strip-components=1
+          echo "$HOME/arm-toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Check the compiler
+        run: arm-none-eabi-gcc --version
+
+      - name: Test the looper logic
+        working-directory: mods/chompi-loop/src/tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -O1 -o test_loopcore test_loopcore.cpp
+          ./test_loopcore
+
+      - name: Assemble CHOMPI LOOP (stock TEMPO + looper files)
+        run: |
+          rm -rf build-area
+          mkdir build-area
+          cp -r firmware/chompi-tempo build-area/chompi-loop
+          cp -r mods/chompi-loop/src/. build-area/chompi-loop/code/src/
+
+      - name: Build libDaisy / DaisySP if they aren't prebuilt
+        working-directory: build-area/chompi-loop/code/libs
+        run: |
+          # rebuild a library if it's missing or isn't a real archive
+          is_lib() { [ "$(head -c 7 "$1" 2>/dev/null)" = '!<arch>' ]; }
+          is_lib libDaisy/build/libdaisy.a || make -C libDaisy -j4
+          is_lib DaisySP/build/libdaisysp.a || make -C DaisySP -j4
+
+      - name: Build the firmware
+        working-directory: build-area/chompi-loop/code/src
+        run: |
+          make clean
+          make -j4
+          echo "---- size ----"
+          arm-none-eabi-size build/CHOMPI.elf
+          cp build/CHOMPI.bin build/CHOMPI_LOOP.bin
+
+      - name: Offer CHOMPI_LOOP.bin for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHOMPI_LOOP
+          path: build-area/chompi-loop/code/src/build/CHOMPI_LOOP.bin
