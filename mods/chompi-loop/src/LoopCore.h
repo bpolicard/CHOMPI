@@ -25,6 +25,15 @@ constexpr size_t   kMaxEvents      = 1024;
 constexpr size_t   kMaxPendingOffs = 32;
 constexpr uint32_t kMinNoteUs      = 1000; // shortest note we'll schedule (1 ms)
 
+/** Quantize grids, coarse to fine, alternating straight and triplet, then off.
+ *  Index:  0    1     2    3     4     5      6     7      8
+ *  Grid:   1/4  1/4T  1/8  1/8T  1/16  1/16T  1/32  1/32T  off  */
+constexpr int     kNumGrids              = 9;
+constexpr int     kGridOff               = 8;
+constexpr int     kGridSixteenth         = 4;
+constexpr int32_t kGridUnits[kNumGrids]  = {768, 512, 384, 256, 192, 128, 96, 64, 0};
+constexpr uint8_t kGridNotes[kNumGrids]  = {4, 6, 8, 12, 16, 24, 32, 48, 0}; // notes per whole note
+
 enum class State : uint8_t
 {
     EMPTY,     // no loop
@@ -36,6 +45,7 @@ enum class State : uint8_t
 
 constexpr uint8_t kFlagHeld     = 1 << 0; // key still held: length unknown, don't play yet
 constexpr uint8_t kFlagFromMidi = 1 << 1; // arrived over MIDI: don't echo to MIDI out
+constexpr uint8_t kFlagSnapped  = 1 << 2; // quantized when recorded (live): play pos as-is
 
 struct Event
 {
@@ -48,6 +58,7 @@ struct Event
     uint8_t  note;    // MIDI note number, for MIDI out
     uint16_t pass;    // recording pass number, for undo
     uint8_t  flags;
+    uint8_t  grid;    // quantize grid (index into kGridUnits) when this note was played
 };
 
 /** Where the looper sends its notes. NoteLooper implements this. */
@@ -66,9 +77,10 @@ class LoopCore
   public:
     void Init(Output *out)
     {
-        out_      = out;
-        grid_     = kUnitsPerBeat / 4; // 1/16 notes
-        strength_ = 100;
+        out_         = out;
+        record_grid_ = kGridSixteenth;
+        strength_    = 100;
+        live_        = true;
         running_  = false;
         have_time_ = false;
         sync_      = false;
@@ -81,12 +93,23 @@ class LoopCore
         ClearAll();
     }
 
-    /** grid_units: 0 = off. strength: 0-100 (%) */
-    void SetQuantize(int32_t grid_units, int32_t strength_pct)
+    /** Grid for notes played from now on (index into kGridUnits).
+     *  Notes already in the loop keep the grid they were played with. */
+    void SetRecordGrid(int grid_index)
     {
-        grid_     = grid_units < 0 ? 0 : grid_units;
+        record_grid_ = grid_index < 0 ? 0 : (grid_index >= kNumGrids ? kGridOff : grid_index);
+    }
+    int GetRecordGrid() const { return record_grid_; }
+
+    /** 0-100 (%): how far a note is pulled toward its grid line */
+    void SetStrength(int32_t strength_pct)
+    {
         strength_ = strength_pct < 0 ? 0 : (strength_pct > 100 ? 100 : strength_pct);
     }
+
+    /** true: quantize note starts as they're recorded (default).
+     *  false: keep the played timing and quantize on playback. */
+    void SetLiveQuantize(bool live) { live_ = live; }
 
     /** sync: following an external clock. beat_phase: units since the last beat line. */
     void SetSyncInfo(bool sync, int32_t beat_phase)
@@ -139,8 +162,20 @@ class LoopCore
             return;
         }
 
+        int32_t p     = pos_;
+        uint8_t flags = kFlagHeld | (from_midi ? kFlagFromMidi : 0);
+        if(live_)
+        {
+            // Live quantize: the note sounds right away, but its start is stored
+            // on the grid. (Its length stays exactly as played.)
+            p = Pull(p, kGridUnits[record_grid_]);
+            if(state_ == State::OVERDUB)
+                p = Mod(p, len_); // a grid line at the loop end is the downbeat
+            flags |= kFlagSnapped;
+        }
+
         Event &e  = events_[num_events_++];
-        e.pos     = pos_;
+        e.pos     = p;
         e.rec_odo = odo_;
         e.dur_us  = now_us_; // note-on time until the key is released
         e.key     = key;
@@ -148,7 +183,8 @@ class LoopCore
         e.engine  = engine;
         e.note    = note;
         e.pass    = pass_;
-        e.flags   = kFlagHeld | (from_midi ? kFlagFromMidi : 0);
+        e.flags   = flags;
+        e.grid    = static_cast<uint8_t>(record_grid_);
     }
 
     void NoteOff(int8_t key)
@@ -268,15 +304,12 @@ class LoopCore
         return r;
     }
 
-    /** Quantized position of an event within the loop. */
+    /** Where an event plays within the loop. */
     int32_t Quantized(const Event &e) const
     {
         int32_t p = e.pos;
-        if(grid_ > 0 && strength_ > 0)
-        {
-            const int32_t nearest = ((p + grid_ / 2) / grid_) * grid_;
-            p += ((nearest - p) * strength_) / 100;
-        }
+        if(!(e.flags & kFlagSnapped))
+            p = Pull(p, kGridUnits[e.grid < kNumGrids ? e.grid : kGridOff]);
         if(len_ > 0 && p >= len_)
             p -= len_; // a grid line at the loop end belongs to the downbeat
         return p;
@@ -297,6 +330,22 @@ class LoopCore
     {
         int32_t r = a % m;
         return r < 0 ? r + m : r;
+    }
+
+    /** Nearest multiple of g (works for negative positions too). */
+    static int32_t RoundToGrid(int32_t p, int32_t g)
+    {
+        const int32_t f = p + g / 2;
+        const int32_t d = f >= 0 ? f / g : -((-f + g - 1) / g); // floor(f / g)
+        return d * g;
+    }
+
+    /** Pull a position toward grid g by the quantize strength. g = 0: unchanged. */
+    int32_t Pull(int32_t p, int32_t g) const
+    {
+        if(g <= 0 || strength_ <= 0)
+            return p;
+        return p + ((RoundToGrid(p, g) - p) * strength_) / 100;
     }
 
     void ClearAll()
@@ -520,8 +569,9 @@ class LoopCore
     uint16_t pass_;
     uint32_t odo_;       // playhead odometer: total units travelled while running
 
-    int32_t grid_;
+    int     record_grid_;
     int32_t strength_;
+    bool    live_;
 
     bool     overdub_after_close_;
 

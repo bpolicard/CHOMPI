@@ -359,6 +359,11 @@ class clockManager {
         }
     }
 
+    /** Forget the last tap, so the next press starts a new tap-tempo count */
+    void cancelTap() {
+        tapTempoTimer = System::GetNow() - tapTempoTimeout - 1;
+    }
+
     float processTapClock(float enc_value) {
         uint32_t now = System::GetNow();
         float ret;

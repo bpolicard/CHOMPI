@@ -38,6 +38,7 @@ class NoteLooper : public looper::Output
   public:
     static constexpr uint32_t kTapMaxMs       = 400;  // longer than this isn't a tap
     static constexpr uint32_t kClearHoldMs    = 1000; // shift + hold Loop
+    static constexpr uint32_t kGridShowMs     = 1500; // grid display after a change
 
     void Init(BaseEngine           **engines,
               chompi::Hardware      *hw,
@@ -53,8 +54,13 @@ class NoteLooper : public looper::Output
         transport_out_ = options->transport_type == 0 || options->transport_type == 1;
 
         core_.Init(this);
-        core_.SetQuantize(GridToUnits(options->loop_quantize_grid),
-                          options->loop_quantize_strength);
+        core_.SetStrength(options->loop_quantize_strength);
+        core_.SetLiveQuantize(options->loop_live_quantize);
+        grid_home_       = GridIndexFromNotes(options->loop_quantize_grid);
+        grid_offset_     = 0;
+        grid_changed_ms_ = 0;
+        grid_shown_      = false;
+        core_.SetRecordGrid(ActiveGridIndex());
 
         chompi_down_ = chompi_candidate_ = chompi_other_ = false;
         loop_down_ = loop_shift_ = loop_clear_fired_ = false;
@@ -84,6 +90,45 @@ class NoteLooper : public looper::Output
     {
         LooperInput in{LooperInput::Type::PLAY_TOGGLE, 0, 0, 0, 0};
         input_fifo_.PushBack(in);
+    }
+
+    /** Press + turn the tempo knob: scroll through every grid
+     *  (1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T, off). */
+    void ScrollGrid(int turns)
+    {
+        int h = grid_home_ + turns;
+        h     = h < 0 ? 0 : (h >= looper::kNumGrids ? looper::kNumGrids - 1 : h);
+        grid_home_   = static_cast<int8_t>(h);
+        grid_offset_ = 0;
+        MarkGridChanged();
+        if(cm_)
+            cm_->cancelTap(); // a press used for turning shouldn't count toward tap tempo
+    }
+
+    /** Shift + turn the tempo knob: hop to the nearest straight / triplet grid
+     *  just above or below the scrolled-to grid, and back. */
+    void FlipGrid(int dir)
+    {
+        int o = grid_offset_ + (dir > 0 ? 1 : -1);
+        o     = o < -1 ? -1 : (o > 1 ? 1 : o);
+        const int a = grid_home_ + o;
+        if(a >= 0 && a < looper::kNumGrids)
+            grid_offset_ = static_cast<int8_t>(o);
+        MarkGridChanged();
+    }
+
+    /** Grid used for new notes (index into looper::kGridUnits) */
+    int ActiveGridIndex() const
+    {
+        const int a = grid_home_ + grid_offset_;
+        return a < 0 ? 0 : (a >= looper::kNumGrids ? looper::kNumGrids - 1 : a);
+    }
+    int HomeGridIndex() const { return grid_home_; }
+
+    /** True for a moment after the grid changes, so the keys can show it */
+    bool ShowGrid() const
+    {
+        return grid_shown_ && daisy::System::GetNow() - grid_changed_ms_ < kGridShowMs;
     }
 
     // ------------- audio callback side -------------
@@ -186,6 +231,7 @@ class NoteLooper : public looper::Output
             return;
 
         core_.SetSyncInfo(cm_->getClockMode() == SYNC, cm_->getBeatPhaseUnits());
+        core_.SetRecordGrid(ActiveGridIndex());
         core_.Process(cm_->getTimelineUnits(), daisy::System::GetUs());
 
         while(!input_fifo_.IsEmpty())
@@ -249,20 +295,19 @@ class NoteLooper : public looper::Output
     }
 
   private:
-    /** options.json grid value (notes per whole note) -> units. 0 = off. */
-    static int32_t GridToUnits(uint8_t grid)
+    /** options.json grid value (notes per whole note, 0 = off) -> grid index */
+    static int8_t GridIndexFromNotes(uint8_t notes)
     {
-        switch(grid)
-        {
-            case 0: return 0;
-            case 4:
-            case 8:
-            case 12:
-            case 16:
-            case 24:
-            case 32: return looper::kUnitsPerBar / grid;
-            default: return looper::kUnitsPerBar / 16;
-        }
+        for(int i = 0; i < looper::kNumGrids; i++)
+            if(looper::kGridNotes[i] == notes)
+                return static_cast<int8_t>(i);
+        return looper::kGridSixteenth;
+    }
+
+    void MarkGridChanged()
+    {
+        grid_changed_ms_ = daisy::System::GetNow();
+        grid_shown_      = true;
     }
 
     void TogglePlay()
@@ -298,6 +343,12 @@ class NoteLooper : public looper::Output
     uint8_t midi_ch_[2];
     bool    transport_out_;
     bool    initialized_ = false;
+
+    // quantize grid: set from the UI (main loop), read in the audio callback
+    volatile int8_t grid_home_   = looper::kGridSixteenth;
+    volatile int8_t grid_offset_ = 0;
+    uint32_t        grid_changed_ms_ = 0;
+    bool            grid_shown_      = false;
 
     // CHOMPI key gesture
     bool     chompi_down_;

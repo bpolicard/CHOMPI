@@ -130,6 +130,36 @@ namespace chompi
 
     static const uint8_t knob_num_pages[6] = {3, 2, 2, 2, 1, 2};
 
+    /** LOOPER: for a moment after the quantize grid changes, show it on white keys 1-9.
+     *  Keys 1-8: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T (straight = teal,
+     *  triplet = pink). Key 9: off (white). Bright = grid for new notes; medium = the
+     *  grid you scrolled to, when you've hopped away from it with shift; dim = the rest.
+     *  Returns false and draws nothing when there's nothing to show. */
+    static bool DrawLooperGrid(const NoteLooper *lp)
+    {
+        if (!lp || !lp->ShowGrid()) {
+            return false;
+        }
+        static const Hardware::SwId grid_keys[looper::kNumGrids] = {
+            Hardware::SwId::KEY_1, Hardware::SwId::KEY_2, Hardware::SwId::KEY_3,
+            Hardware::SwId::KEY_4, Hardware::SwId::KEY_5, Hardware::SwId::KEY_6,
+            Hardware::SwId::KEY_7, Hardware::SwId::KEY_8, Hardware::SwId::KEY_9};
+
+        // all 25 keys off first
+        for (size_t i = 7; i < 25 + 7; i++) {
+            SetSmtLed(led_map[i], 0, 0, 0);
+        }
+
+        const int active = lp->ActiveGridIndex();
+        const int home = lp->HomeGridIndex();
+        for (int g = 0; g < looper::kNumGrids; g++) {
+            const float *c = g == looper::kGridOff ? white : (g % 2 ? pink : teal);
+            const float level = g == active ? 1.f : (g == home ? .35f : .12f);
+            SetSmtLedFloat(led_map[static_cast<int>(grid_keys[g])], c[0] * level, c[1] * level, c[2] * level);
+        }
+        return true;
+    }
+
     class NormalPage : public daisy::UiPage
     {
     public:
@@ -526,6 +556,9 @@ namespace chompi
 
             SetPthLedFloat(led_map[5], r, g, b);
 
+            // LOOPER: quantize grid display (overrides the keys for a moment)
+            DrawLooperGrid(looper_);
+
             // ========   send the data   =========
             fill_led_data();
         }
@@ -874,13 +907,12 @@ namespace chompi
                 }
                 break;
                 case 4: {
-                    if (clock_manager_->getClockMode() == FREE) {
-                        if (transport_held) {
-                            clock_manager_->changeDiv(turns, fx_->getEngine());
-                        }
-                        else {
-                            clock_manager_->changeTempo(turns);
-                        }
+                    if (transport_held && looper_) {
+                        // LOOPER: press + turn the tempo knob scrolls the quantize grid
+                        looper_->ScrollGrid(turns);
+                    }
+                    else if (clock_manager_->getClockMode() == FREE) {
+                        clock_manager_->changeTempo(turns);
                     }
                     else {
                         clock_manager_->changeDiv(turns, fx_->getEngine());

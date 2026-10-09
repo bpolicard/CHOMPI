@@ -43,6 +43,7 @@ class OptionsManager
         delay_mute = false;
         loop_quantize_grid = 16;      // 1/16 notes
         loop_quantize_strength = 100; // %
+        loop_live_quantize = true;    // quantize note starts as they're recorded
 
         /** TODO: make sure the open settings are correct */
         const char fname[32] = "options.json";
@@ -141,7 +142,7 @@ class OptionsManager
         sprintf(append, "%s", delay_mute ? "true" : "false");
         StrAppend(opt_file, append);
 
-        // Looper quantize grid: notes per whole note (4, 8, 12, 16, 24, 32), 0 = off
+        // Looper quantize grid: notes per whole note (4, 6, 8, 12, 16, 24, 32, 48), 0 = off
         sprintf(append, "\n\t\t},\n\t\t{\n\t\t\t\"name\": \"Loop Quantize Grid\",\n\t\t\t\"value\": ");
         StrAppend(opt_file, append);
 
@@ -153,6 +154,14 @@ class OptionsManager
         StrAppend(opt_file, append);
 
         sprintf(append, "%d", int(loop_quantize_strength));
+        StrAppend(opt_file, append);
+
+        // Looper live quantize: true = note starts quantized as you play them,
+        // false = timing kept and quantized on playback
+        sprintf(append, "\n\t\t},\n\t\t{\n\t\t\t\"name\": \"Loop Live Quantize\",\n\t\t\t\"value\": ");
+        StrAppend(opt_file, append);
+
+        sprintf(append, "%s", loop_live_quantize ? "true" : "false");
         StrAppend(opt_file, append);
 
         // footer
@@ -228,10 +237,12 @@ class OptionsManager
                     field = 11;
                 if(strcmp(value, "Loop Quantize Strength") == 0 && json_res == JSONSuccess)
                     field = 12;
+                if(strcmp(value, "Loop Live Quantize") == 0 && json_res == JSONSuccess)
+                    field = 13;
 
                 value[value_len] = save;
 
-                if(field == 0 || field == 4 || field == 6 || field == 7 || field == 8 || field == 10)
+                if(field == 0 || field == 4 || field == 6 || field == 7 || field == 8 || field == 10 || field == 13)
                 {
                     sprintf(query, "chompi[%d].value", i);
                     json_res = JSON_Search(
@@ -251,6 +262,8 @@ class OptionsManager
                         midi_cc_out = false;
                     else if(strcmp(value, "true") == 0 && json_res == JSONSuccess && field == 10)
                         delay_mute = true;
+                    else if(strcmp(value, "false") == 0 && json_res == JSONSuccess && field == 13)
+                        loop_live_quantize = false;
 
                     value[value_len] = save;
                 }
@@ -264,7 +277,7 @@ class OptionsManager
                         save = value[value_len];
                         value[value_len] = '\0';
                         const int v = atoi(value);
-                        if(field == 11 && (v == 0 || v == 4 || v == 8 || v == 12 || v == 16 || v == 24 || v == 32))
+                        if(field == 11 && (v == 0 || v == 4 || v == 6 || v == 8 || v == 12 || v == 16 || v == 24 || v == 32 || v == 48))
                             loop_quantize_grid = static_cast<uint8_t>(v);
                         else if(field == 12 && v >= 0 && v <= 100)
                             loop_quantize_strength = static_cast<uint8_t>(v);
@@ -319,6 +332,7 @@ class OptionsManager
     bool delay_mute;
     uint8_t loop_quantize_grid;     // notes per whole note, 0 = off
     uint8_t loop_quantize_strength; // 0-100 %
+    bool loop_live_quantize;        // true: quantize while recording
     
     /**
     * if true, the shift menu is quantized, and normal is not.
@@ -330,7 +344,7 @@ class OptionsManager
         FIL fptr_opt;
 
         static const size_t kOptFileSize = 4096;
-        static const size_t kNumOptions = 13;
+        static const size_t kNumOptions = 14;
         char opt_file[kOptFileSize];
 };
 } // namespace chompi

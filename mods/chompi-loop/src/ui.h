@@ -149,6 +149,7 @@ namespace chompi
         {
             looper_ = looper;
             normal_page_.SetLooper(looper);
+            menu_page_.SetLooper(looper);
         }
 
         uint32_t last_force_off;

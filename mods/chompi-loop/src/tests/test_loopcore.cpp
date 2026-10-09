@@ -223,6 +223,7 @@ static void test_sync_snap()
     }
     {
         Sim s;
+        s.core.SetLiveQuantize(false); // check the raw (unquantized) wrap
         s.core.SetSyncInfo(true, 700); // 68 units before the next beat (early)
         s.core.ChompiTap(s.timeline());
         s.core.NoteOn(0, 3, 0, 60, false);
@@ -262,22 +263,32 @@ static void test_stop_start()
 
 static void test_strength()
 {
-    printf("-- quantize strength\n");
-    Sim s;
-    s.core.SetQuantize(kUnitsPerBeat / 4, 50); // 1/16 at 50%
-    s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 1, 0, 60, false);
-    s.run_to(50);
-    s.core.NoteOff(1);
-    s.run_to(500 + 60); // beat 2 + 60 ms (~92 units late; 16th = 192)
-    s.core.NoteOn(0, 2, 0, 60, false);
-    s.run_to(600);
-    s.core.NoteOff(2);
-    s.run_to(2002);
-    s.core.ChompiTap(s.timeline());
-    const Event &e = s.core.GetEvent(1);
-    const int32_t q = s.core.Quantized(e);
-    CHECK(q > kUnitsPerBeat && q < e.pos, "pulled halfway toward the grid: raw %d q %d", e.pos, q);
+    printf("-- quantize strength (live and playback)\n");
+    for(int live = 0; live < 2; live++)
+    {
+        Sim s;
+        s.core.SetLiveQuantize(live == 1);
+        s.core.SetStrength(50); // 1/16 at 50%
+        s.core.ChompiTap(s.timeline());
+        s.core.NoteOn(0, 1, 0, 60, false);
+        s.run_to(50);
+        s.core.NoteOff(1);
+        s.run_to(500 + 60); // beat 2 + 60 ms (~92 units late; 16th = 192)
+        s.core.NoteOn(0, 2, 0, 60, false);
+        s.run_to(600);
+        s.core.NoteOff(2);
+        s.run_to(2002);
+        s.core.ChompiTap(s.timeline());
+        const Event  &e = s.core.GetEvent(1);
+        const int32_t q = s.core.Quantized(e);
+        const int32_t played = 92; // approx units after beat 2
+        CHECK(q > kUnitsPerBeat && q < kUnitsPerBeat + played,
+              "%s: pulled halfway toward the grid: q %d", live ? "live" : "playback", q);
+        if(live)
+            CHECK(e.pos == q, "live: stored position is the quantized one");
+        else
+            CHECK(e.pos > q, "playback: raw timing kept (raw %d, q %d)", e.pos, q);
+    }
 }
 
 
@@ -313,8 +324,111 @@ static void test_overdub_no_flam_and_held()
     CHECK(s.ons_between(9400, 9600, 6).size() == 1, "replays after release");
 }
 
+static void test_live_snap()
+{
+    printf("-- live quantize: start stored on the grid, length kept\n");
+    Sim s; // live is the default
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 1, 0, 60, false);
+    s.run_to(40);
+    s.core.NoteOff(1);
+    s.run_to(500 + 37); // beat 2, 37 ms late -> snaps to beat 2 (768)
+    s.core.NoteOn(0, 2, 0, 60, false);
+    s.run_to(500 + 37 + 123);
+    s.core.NoteOff(2);
+    s.run_to(2003);
+    s.core.ChompiTap(s.timeline());
+    const Event &e = s.core.GetEvent(1);
+    CHECK(e.pos == kUnitsPerBeat, "stored on beat 2, got %d", e.pos);
+    CHECK(e.dur_us > 121000 && e.dur_us < 125000, "length kept as played: %u", e.dur_us);
+    s.run_to(4600);
+    auto h = s.ons_between(2400, 2600, 2);
+    CHECK(h.size() == 1 && h[0].t_ms >= 2499 && h[0].t_ms <= 2501, "plays on beat 2 of pass 2");
+}
+
+static void test_grid_change_only_new_notes()
+{
+    printf("-- changing the grid only affects notes played afterwards\n");
+    for(int live = 0; live < 2; live++)
+    {
+        Sim s;
+        s.core.SetLiveQuantize(live == 1);
+        s.core.ChompiTap(s.timeline());
+        s.core.NoteOn(0, 1, 0, 60, false);
+        s.run_to(20);
+        s.core.NoteOff(1);
+        s.run_to(2005);
+        s.core.ChompiTap(s.timeline()); // 1 bar
+        s.core.ChompiTap(s.timeline()); // overdub
+        // pass 2 starts at 2000. Play at +700 ms (1075 units) on the 1/16 grid -> 1152
+        s.run_to(2700);
+        s.core.NoteOn(0, 2, 0, 60, false);
+        s.run_to(2710);
+        s.core.NoteOff(2);
+        s.core.SetRecordGrid(3); // switch to 1/8 triplets (256 units)
+        // play at +1300 ms (1997 units): 1/8T grid -> 2048
+        s.run_to(3300);
+        s.core.NoteOn(0, 3, 0, 60, false);
+        s.run_to(3310);
+        s.core.NoteOff(3);
+        const int32_t q2 = s.core.Quantized(s.core.GetEvent(1));
+        const int32_t q3 = s.core.Quantized(s.core.GetEvent(2));
+        CHECK(q2 == 1152, "%s: earlier note stays on its 1/16 line: %d", live ? "live" : "playback", q2);
+        CHECK(q3 == 2048, "%s: new note on the 1/8T grid: %d", live ? "live" : "playback", q3);
+        s.core.SetRecordGrid(kGridSixteenth); // changing back doesn't move the triplet note
+        CHECK(s.core.Quantized(s.core.GetEvent(2)) == 2048, "triplet note stays put");
+    }
+}
+
+static void test_all_grids()
+{
+    printf("-- every grid value\n");
+    const int32_t expect[kNumGrids] = {768, 512, 384, 256, 192, 128, 96, 64, 0};
+    for(int g = 0; g < kNumGrids; g++)
+    {
+        CHECK(kGridUnits[g] == expect[g], "grid %d units", g);
+        if(kGridUnits[g])
+            CHECK(kUnitsPerBar % kGridUnits[g] == 0, "grid %d divides the bar", g);
+        CHECK(kGridNotes[g] == 0 || kUnitsPerBar / kGridNotes[g] == kGridUnits[g], "grid %d notes", g);
+    }
+    // 1/4 triplets: a note just after the second triplet (1024 + 30) snaps to 1024
+    Sim s;
+    s.core.SetRecordGrid(1);
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 1, 0, 60, false);
+    s.run_to(10);
+    s.core.NoteOff(1);
+    s.run_to((1024 + 30) / 1.536);
+    s.core.NoteOn(0, 2, 0, 60, false);
+    s.run_to(800);
+    s.core.NoteOff(2);
+    CHECK(s.core.GetEvent(1).pos == 1024, "1/4T snap, got %d", s.core.GetEvent(1).pos);
+    // grid off: raw timing stored
+    s.core.SetRecordGrid(kGridOff);
+    s.run_to(900);
+    s.core.NoteOn(0, 3, 0, 60, false);
+    s.run_to(910);
+    s.core.NoteOff(3);
+    const int32_t raw = s.core.GetEvent(2).pos;
+    CHECK(raw % 64 != 0 || raw % 192 != 0, "off: unsnapped (%d)", raw);
+}
+
+static void test_live_sync_early()
+{
+    printf("-- live quantize with an early first note in sync mode\n");
+    Sim s;
+    s.core.SetSyncInfo(true, 700); // 68 units before the beat
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 3, 0, 60, false);
+    CHECK(s.core.GetEvent(0).pos == 0, "snapped onto the beat, got %d", s.core.GetEvent(0).pos);
+}
+
 int main()
 {
+    test_live_snap();
+    test_grid_change_only_new_notes();
+    test_all_grids();
+    test_live_sync_early();
     test_overdub_no_flam_and_held();
     test_basic_free();
     test_late_close();

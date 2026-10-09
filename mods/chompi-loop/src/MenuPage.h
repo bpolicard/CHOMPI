@@ -512,6 +512,9 @@ namespace chompi
                 SetSmtLedFloat(e, orange[0], orange[1], orange[2]);
             }
 
+            // LOOPER: quantize grid display (overrides the keys for a moment)
+            DrawLooperGrid(looper_);
+
             // ========   send the data   =========
             fill_led_data();
         }
@@ -628,9 +631,11 @@ namespace chompi
                     break;
                     case 4:
                     {
-                        arp_randomness += inc;
-                        arp_randomness = fclamp(arp_randomness, 0.f, 1.f);
-                        arpSeq_->setRandomness(arp_randomness, fx_->getEngine());
+                        // LOOPER: shift + turn the tempo knob hops to the nearest
+                        // straight / triplet grid (replaces the arp randomness)
+                        if (looper_ && turns != 0) {
+                            looper_->FlipGrid(turns > 0 ? 1 : -1);
+                        }
                     }
                     break;
                     case 5:
@@ -711,6 +716,9 @@ namespace chompi
             engines_[mode]->setLoop(loop);
             engines_[mode]->setSustain(sustain);
         }
+
+        /** LOOPER */
+        void SetLooper(NoteLooper *looper) { looper_ = looper; }
 
         bool OnButton(uint16_t buttonID,
                 uint8_t numberOfPresses,
@@ -1305,6 +1313,7 @@ namespace chompi
         inline void NoSDCard() { no_sd_card_ = true; }
 
     private:
+        NoteLooper *looper_ = nullptr; // LOOPER
         clockManager *clock_manager_;
         BaseEngine **engines_;
         fxEngine *fx_;

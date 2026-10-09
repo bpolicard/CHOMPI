@@ -1,4 +1,4 @@
-# CHOMPI LOOP — phase 2: core note looper
+# CHOMPI LOOP — phase 2.1: core note looper
 
 A standalone firmware based on TEMPO. TEMPO's latching arpeggiator is replaced by a
 polyphonic, quantized note-event looper that follows the internal clock or MIDI clock.
@@ -42,9 +42,18 @@ Mode switch **down** (the CHOMPI key is shift):
 | CHOMPI + Loop, tap | Undo the most recent recording pass (undoing the first take clears). |
 | CHOMPI + Loop, hold 1 s | Clear the loop. |
 | Play | Start / stop the loop and clock. Restarts a loop from the top. Sends MIDI Start/Stop in internal-clock mode (per the existing transport option). |
+| Press + turn Tempo knob | Scroll the quantize grid through every value: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T, off. (Replaces TEMPO's clock division.) |
+| CHOMPI + turn Tempo knob | Hop to the nearest straight / triplet grid just above or below the one you scrolled to (e.g. from 1/8T: up to 1/16, down to 1/8), and back. (Replaces TEMPO's arp randomness.) |
 
 A "tap" is a press shorter than 0.4 s with no other key or knob touched; anything else
-is a normal shift function. Mode switch **up**: the CHOMPI key records audio samples
+is a normal shift function.
+
+**Quantize grid:** a grid change only affects notes you play afterwards; notes already
+in the loop stay where they are. For 1.5 s after a change, white keys 1–9 show the grid:
+keys 1–8 are 1/4 through 1/32T (straight = teal, triplet = pink), key 9 is off (white).
+Bright = the grid new notes will use; medium = the grid you scrolled to, while you've
+hopped away from it with CHOMPI + Tempo; dim = the others. Turning the Tempo knob while
+pressed doesn't count toward tap tempo. Mode switch **up**: the CHOMPI key records audio samples
 exactly as in TEMPO.
 
 **Loop LED:** blinking red = armed, red = recording, pink = overdub, green = playing
@@ -60,11 +69,14 @@ of the incoming clock.
 
 | Name | Values | Default |
 |---|---|---|
-| `Loop Quantize Grid` | notes per whole note: 4, 8, 12 (8th triplets), 16, 24 (16th triplets), 32, or 0 = off | 16 |
-| `Loop Quantize Strength` | 0–100 (%): how far each note is pulled toward the grid | 100 |
+| `Loop Quantize Grid` | grid at power-on, in notes per whole note: 4, 6 (1/4T), 8, 12 (1/8T), 16, 24 (1/16T), 32, 48 (1/32T), or 0 = off | 16 |
+| `Loop Quantize Strength` | 0–100 (%): how far each note start is pulled toward the grid | 100 |
+| `Loop Live Quantize` | `true`: note starts are quantized as you record them. `false`: your timing is kept and quantized on playback | `true` |
 
-Quantizing happens on playback; your original timing is always kept, so changing these
-later re-quantizes existing loops.
+Either way, notes you play sound immediately (no added latency), and note *lengths* are
+kept exactly as you held them. Live quantize stores each note's start on the grid as it's
+recorded. Playback quantize stores your exact timing and pulls it to the grid each pass.
+In both modes each note keeps the grid that was active when you played it.
 
 ## Testing checklist
 
@@ -88,7 +100,8 @@ Please send back:
 
 - The shift menu's LEDs flash briefly on a CHOMPI tap (cosmetic).
 - The Loop key alone does nothing yet (phase 3), and the arpeggiator can't be turned on.
-  TEMPO's arp rest patterns (shift + Loop) are gone.
+  TEMPO's arp rest patterns (shift + Loop), arp randomness (shift + Tempo), and clock
+  division (press + turn Tempo) are gone.
 - Bars are 4/4. Loops are capped at 60 bars and 1,024 notes.
 - Repeating the same key quickly retriggers its voice (cutting the previous tail), and
   each engine has 8 voices. A stacking option is planned.
@@ -124,7 +137,7 @@ Please send back:
   1/2, 1/4, 1/8, 1/16, 1/32 beat. The bar view and selections follow the unit.
 
 **Phase 6 — Polish**
-- Quantize grid / strength on the hardware, same-note voice stacking, saving loops to
+- Quantize strength on the hardware, same-note voice stacking, saving loops to
   `/Loops` on the SD card, per-engine loop lengths.
 
 ## Developer notes
