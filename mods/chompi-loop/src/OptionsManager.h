@@ -44,6 +44,7 @@ class OptionsManager
         loop_quantize_grid = 16;      // 1/16 notes
         loop_quantize_strength = 100; // %
         loop_live_quantize = true;    // quantize note starts as they're recorded
+        midi_note_out = true;         // false: MIDI out carries clock / transport only
 
         /** TODO: make sure the open settings are correct */
         const char fname[32] = "options.json";
@@ -164,6 +165,14 @@ class OptionsManager
         sprintf(append, "%s", loop_live_quantize ? "true" : "false");
         StrAppend(opt_file, append);
 
+        // MIDI note out: false = no note on / off messages are sent (clock, transport
+        // and CCs still are), e.g. to pass sync on to a device that shouldn't hear the keys
+        sprintf(append, "\n\t\t},\n\t\t{\n\t\t\t\"name\": \"MIDI Note Out\",\n\t\t\t\"value\": ");
+        StrAppend(opt_file, append);
+
+        sprintf(append, "%s", midi_note_out ? "true" : "false");
+        StrAppend(opt_file, append);
+
         // footer
         sprintf(append, "\n\t\t}\n\t]\n}");
         StrAppend(opt_file, append);
@@ -239,10 +248,13 @@ class OptionsManager
                     field = 12;
                 if(strcmp(value, "Loop Live Quantize") == 0 && json_res == JSONSuccess)
                     field = 13;
+                if(strcmp(value, "MIDI Note Out") == 0 && json_res == JSONSuccess)
+                    field = 14;
 
                 value[value_len] = save;
 
-                if(field == 0 || field == 4 || field == 6 || field == 7 || field == 8 || field == 10 || field == 13)
+                if(field == 0 || field == 4 || field == 6 || field == 7 || field == 8 || field == 10 || field == 13
+                   || field == 14)
                 {
                     sprintf(query, "chompi[%d].value", i);
                     json_res = JSON_Search(
@@ -264,6 +276,8 @@ class OptionsManager
                         delay_mute = true;
                     else if(strcmp(value, "false") == 0 && json_res == JSONSuccess && field == 13)
                         loop_live_quantize = false;
+                    else if(strcmp(value, "false") == 0 && json_res == JSONSuccess && field == 14)
+                        midi_note_out = false;
 
                     value[value_len] = save;
                 }
@@ -333,6 +347,7 @@ class OptionsManager
     uint8_t loop_quantize_grid;     // notes per whole note, 0 = off
     uint8_t loop_quantize_strength; // 0-100 %
     bool loop_live_quantize;        // true: quantize while recording
+    bool midi_note_out;             // false: no note on / off on MIDI out
     
     /**
     * if true, the shift menu is quantized, and normal is not.
@@ -344,7 +359,7 @@ class OptionsManager
         FIL fptr_opt;
 
         static const size_t kOptFileSize = 4096;
-        static const size_t kNumOptions = 14;
+        static const size_t kNumOptions = 15;
         char opt_file[kOptFileSize];
 };
 } // namespace chompi

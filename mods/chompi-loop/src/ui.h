@@ -301,10 +301,12 @@ namespace chompi
 
         void InitFromPresets()
         {
-            float defaults[11] = {  enc_defaults[0][0], enc_defaults[1][0], enc_defaults[2][0],
+            float defaults[PresetManager::kMaxControls] = {
+                                    enc_defaults[0][0], enc_defaults[1][0], enc_defaults[2][0],
                                     enc_defaults[0][1], enc_defaults[1][1],
                                     enc_defaults[0][2], enc_defaults[1][2],
-                                    .5f, 0.f, 1.f, 1.f};
+                                    .5f, 0.f, 1.f, 1.f,
+                                    0.f}; // LOOPER: Chroma key transpose
 
             presets_manager->Init(defaults);
 

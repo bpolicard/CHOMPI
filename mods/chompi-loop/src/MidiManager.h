@@ -49,16 +49,27 @@ class MidiManager {
             // only accept input on channel 1, but transport is global
             if (event.type == daisy::MidiMessageType::SystemRealTime)
             {
+                // LOOPER: when following an external clock, pass it on. Clock goes out
+                // per "MIDI Clock Out", Start / Stop per the transport option's "out"
+                // half, so CHOMPI can receive and send sync at the same time.
+                const bool synced = clock_manager_->getClockMode() == SYNC;
+
                 if (event.srt_type == daisy::SystemRealTimeType::TimingClock) {
-                    if (clock_manager_->getClockMode() == SYNC) {
+                    if (synced) {
                         clock_manager_->processMidiClock();
+                        if (clock_out) {
+                            QueueMidiClock();
+                        }
                     }
                 }
                 else if (event.srt_type == daisy::SystemRealTimeType::Start) {
-                    if (clock_manager_->getClockMode() == SYNC) {
+                    if (synced) {
                         clock_manager_->markSongStart(); // beat lines for snapping the loop start
+                        if (transport_out) {
+                            hw_->queueMidiTransport(0, true);
+                        }
                     }
-                    if (clock_manager_->getClockMode() == SYNC && transport_in) {
+                    if (synced && transport_in) {
                         if (looper_) {
                             looper_->ExternalStart();
                         }
@@ -68,7 +79,10 @@ class MidiManager {
                     }
                 }
                 else if (event.srt_type == daisy::SystemRealTimeType::Stop) {
-                    if (clock_manager_->getClockMode() == SYNC && transport_in) {
+                    if (synced && transport_out) {
+                        hw_->queueMidiTransport(0, false);
+                    }
+                    if (synced && transport_in) {
                         if (looper_) {
                             looper_->ExternalStop();
                         }
@@ -205,7 +219,10 @@ class MidiManager {
         }
         if (!hw_->midi_out_queue.IsEmpty()) {
             MidiEvent event = hw_->midi_out_queue.PopFront();
-            if (event.type == NoteOn) {
+            if (!note_out && (event.type == NoteOn || event.type == NoteOff)) {
+                // "MIDI Note Out" is off: clock, transport and CCs only
+            }
+            else if (event.type == NoteOn) {
                 uint8_t tx_buf_[3];
                 tx_buf_[0] = 0x90 | (event.channel & 0x0F); // Note On for channel
                 tx_buf_[1] = event.data[0];
@@ -265,10 +282,17 @@ class MidiManager {
         }
     }
 
-    void setMidiOptions(uint8_t in_ch, bool enable_cc_in, size_t enable_transport_in) {
+    /** transport_type: 0 = in + out, 1 = out only, 2 = in only, 3 = none.
+     *  enable_clock_out: pass incoming clock on when following an external clock.
+     *  enable_note_out: false = no note on / off on MIDI out (clock, transport, CCs only). */
+    void setMidiOptions(uint8_t in_ch, bool enable_cc_in, size_t transport_type,
+                        bool enable_clock_out, bool enable_note_out) {
         in_channel = in_ch;
         midi_cc_in = enable_cc_in;
-        transport_in = enable_transport_in == 0 || enable_transport_in == 2;
+        transport_in = transport_type == 0 || transport_type == 2;
+        transport_out = transport_type == 0 || transport_type == 1;
+        clock_out = enable_clock_out;
+        note_out = enable_note_out;
     }
 
     void QueueMidiClock() {
@@ -376,6 +400,9 @@ class MidiManager {
     BaseEngine **engines_;
     bool midi_cc_in;
     bool transport_in;
+    bool transport_out = false; // LOOPER: pass Start / Stop on when synced
+    bool clock_out = false;     // LOOPER: pass clock on when synced
+    bool note_out = true;       // LOOPER: "MIDI Note Out" option
 
     MidiUartHandler uart_midi;
     MidiUsbHandler usb_midi;

@@ -419,7 +419,8 @@ int main(void)
     ui.SetLooper(&noteLooper);
     midi.SetLooper(&noteLooper);
     hw.setMidiCCOut(options.midi_cc_out);
-    midi.setMidiOptions(options.midi_ch_in, options.midi_cc_in, options.transport_type);
+    midi.setMidiOptions(options.midi_ch_in, options.midi_cc_in, options.transport_type,
+                        options.midi_clock_out, options.midi_note_out);
 
     stateSaver.Init();
 

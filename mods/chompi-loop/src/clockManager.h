@@ -183,6 +183,9 @@ class clockManager {
         return static_cast<int32_t>(rel % kTimelineUnitsPerBeat);
     }
 
+    /** Timeline position (in units) of beat 1 of the song, set by MIDI Start. */
+    uint32_t getSongOriginUnits() const { return song_origin_units_; }
+
     void toggleClockMode() {
         mode_ = !mode_;
     }

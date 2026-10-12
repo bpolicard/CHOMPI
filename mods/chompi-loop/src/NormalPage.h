@@ -130,10 +130,32 @@ namespace chompi
 
     static const uint8_t knob_num_pages[6] = {3, 2, 2, 2, 1, 2};
 
+    /** LOOPER: LED brightness for a pulse that peaks on each line of a grid and fades
+     *  until the next one. phase: units since the last line; period: units per line;
+     *  floor: brightness between pulses. */
+    static float LooperPulse(int32_t phase, int32_t period, float floor)
+    {
+        const float x = 1.f - static_cast<float>(phase) / static_cast<float>(period);
+        return floor + (1.f - floor) * x * x;
+    }
+
+    /** LOOPER: pitch-knob LED color while the Chroma keys are transposed:
+     *  up = yellow toward red, down = blue toward purple, further = further along. */
+    static void TransposeLedColor(int semis, float &r, float &g, float &b)
+    {
+        const float t = static_cast<float>(semis < 0 ? -semis : semis) / NoteLooper::kMaxTranspose;
+        const float *from = semis > 0 ? yellow : med_blue;
+        const float *to = semis > 0 ? red : purple;
+        r = color_xfade(from[0], to[0], t);
+        g = color_xfade(from[1], to[1], t);
+        b = color_xfade(from[2], to[2], t);
+    }
+
     /** LOOPER: for a moment after the quantize grid changes, show it on white keys 1-9.
      *  Keys 1-8: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T (straight = teal,
      *  triplet = pink). Key 9: off (white). Bright = grid for new notes; medium = the
      *  grid you scrolled to, when you've hopped away from it with shift; dim = the rest.
+     *  While the transport runs, each key pulses at its own subdivision's rate.
      *  Returns false and draws nothing when there's nothing to show. */
     static bool DrawLooperGrid(const NoteLooper *lp)
     {
@@ -150,11 +172,17 @@ namespace chompi
             SetSmtLed(led_map[i], 0, 0, 0);
         }
 
+        const bool running = lp->IsRunning();
+        const int32_t bar = lp->BarPhaseUnits();
         const int active = lp->ActiveGridIndex();
         const int home = lp->HomeGridIndex();
         for (int g = 0; g < looper::kNumGrids; g++) {
             const float *c = g == looper::kGridOff ? white : (g % 2 ? pink : teal);
-            const float level = g == active ? 1.f : (g == home ? .35f : .12f);
+            float level = g == active ? 1.f : (g == home ? .4f : .15f);
+            const int32_t units = looper::kGridUnits[g];
+            if (running && units > 0) {
+                level *= LooperPulse(bar % units, units, .25f);
+            }
             SetSmtLedFloat(led_map[static_cast<int>(grid_keys[g])], c[0] * level, c[1] * level, c[2] * level);
         }
         return true;
@@ -312,6 +340,11 @@ namespace chompi
                         r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], idx);
                         g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], idx);
                         b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], idx);
+                        // LOOPER: the stepped knob transposes the Chroma keys; show it
+                        if (quantized_pitch_ && fx_->getEngine() == CHROMATIC && looper_
+                            && looper_->Transpose() != 0) {
+                            TransposeLedColor(looper_->Transpose(), r, g, b);
+                        }
                     }
                     else if(page == 1) // sample volume
                     {
@@ -396,21 +429,37 @@ namespace chompi
                         SetPthLedFloat(6, leds_[3], leds_[4], leds_[5]);
                     }
                     else {
+                        float leds_[6]; // left LED, then right LED
                         if (clock_manager_->getClockMode() == FREE) {
                             r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], value);
                             g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], value);
                             b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], value);
 
-                            SetPthLedFloat(5, r, g, b);
-                            SetPthLedFloat(6, r, g, b);
+                            leds_[0] = leds_[3] = r;
+                            leds_[1] = leds_[4] = g;
+                            leds_[2] = leds_[5] = b;
                         }
                         else {
-                            float leds_[6];
                             clock_manager_->fillLEDdata(leds_, fx_->getEngine());
-                            
-                            SetPthLedFloat(5, leds_[0], leds_[1], leds_[2]);
-                            SetPthLedFloat(6, leds_[3], leds_[4], leds_[5]);
                         }
+                            
+                        // LOOPER: while the transport runs, the right LED pulses on the
+                        // beat and the left one at the quantize subdivision (steady dim
+                        // when the grid is off)
+                        if (looper_ && looper_->IsRunning()) {
+                            const int32_t bar = looper_->BarPhaseUnits();
+                            const int32_t sub = looper::kGridUnits[looper_->ActiveGridIndex()];
+                            const float beat_lvl = LooperPulse(bar % looper::kUnitsPerBeat, looper::kUnitsPerBeat, .08f);
+                            const float sub_lvl = sub > 0 ? LooperPulse(bar % sub, sub, .08f) : .3f;
+                            for (int c = 0; c < 3; c++) {
+                                leds_[c] *= sub_lvl;
+                                leds_[3 + c] *= beat_lvl;
+                            }
+                        }
+
+                        SetPthLedFloat(5, leds_[0], leds_[1], leds_[2]);
+                        SetPthLedFloat(6, leds_[3], leds_[4], leds_[5]);
+
                         if (arpSeq_->getPlay(fx_->getEngine())) {
                             if (arpSeq_->getLeftLights()) {
                                 SetPthLedFloat(5, 0.f, 0.f, 0.f);
@@ -731,7 +780,10 @@ namespace chompi
 
             // keys
             default:
-                float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60) : 0.f;
+                // LOOPER: in Chroma the stepped pitch knob transposes the keys (NoteLooper)
+                const int transpose = (fx_->getEngine() == CHROMATIC && looper_) ? looper_->Transpose() : 0;
+                float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60 + transpose) : 0.f;
+                const uint8_t midi_note = static_cast<uint8_t>(key_map[buttonID] + transpose);
                 if (rising)
                 {
                     // real keypress
@@ -769,12 +821,12 @@ namespace chompi
                         }
                         
                         if (!arpSeq_->getPlay(fx_->getEngine()) && !via_looper) {
-                            hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOn);
+                            hw_->queueMidiNote(midi_channel[fx_->getEngine()], midi_note, 127, NoteOn);
                         }
 
                         // LOOPER: record the key press (and sound it, if it's the looper's)
                         if (looper_) {
-                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, key_map[buttonID],
+                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, midi_note,
                                                  via_looper);
                         }
                     }
@@ -800,7 +852,7 @@ namespace chompi
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
                         }
                         if (!via_looper && !arpSeq_->getPlay(fx_->getEngine()) && !arpSeq_->getSustain()) {
-                            hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOff);
+                            hw_->queueMidiNote(midi_channel[fx_->getEngine()], midi_note, 127, NoteOff);
                         }
 
                         // LOOPER: record the key release (sets the note's length, and
@@ -883,7 +935,15 @@ namespace chompi
                 case 0: {
                     if (page == 0) {
                         if (quantized_pitch_) {
-                            enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
+                            if (fx_->getEngine() == CHROMATIC && looper_) {
+                                // LOOPER: in Chroma the stepped knob transposes the keys
+                                if (stepsPerRevolution == 0) {
+                                    looper_->StepTranspose(turns);
+                                }
+                            }
+                            else {
+                                enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
+                            }
                         }
                         else {
                             engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);

@@ -25,7 +25,7 @@ computer) and add `CHOMPI_LOOP.bin`; only one `.bin` can be on the card. The
 `chromatic`, `slice`, and `buffer` folders, `presets.json`, and `options.json` stay
 as they are. Other folders (like `FRIZZ`) are ignored. To go back, swap the `.bin`.
 
-On first boot the firmware rewrites `options.json` with three new entries
+On first boot the firmware rewrites `options.json` with four new entries
 (see below). Stock TEMPO ignores them, so the card still works with TEMPO.
 
 ## Controls in this build
@@ -44,6 +44,7 @@ Mode switch **down** (the CHOMPI key is shift):
 | Play | Start / stop the loop and clock. Restarts a loop from the top. Sends MIDI Start/Stop in internal-clock mode (per the existing transport option). |
 | Press + turn Tempo knob | Scroll the quantize grid through every value: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T, off. (Replaces TEMPO's clock division.) |
 | CHOMPI + turn Tempo knob | Hop to the nearest straight / triplet grid just above or below the one you scrolled to (e.g. from 1/8T: up to 1/16, down to 1/8), and back. (Replaces TEMPO's arp randomness.) |
+| Stepped pitch knob, in Chroma | Transposes the keys instead of re-pitching the sample (see below). In Slice it steps the pitch as in TEMPO. |
 
 A "tap" is a press shorter than 0.4 s with no other key or knob touched; anything else
 is a normal shift function.
@@ -52,9 +53,16 @@ is a normal shift function.
 in the loop stay where they are. For 1.5 s after a change, white keys 1–9 show the grid:
 keys 1–8 are 1/4 through 1/32T (straight = teal, triplet = pink), key 9 is off (white).
 Bright = the grid new notes will use; medium = the grid you scrolled to, while you've
-hopped away from it with CHOMPI + Tempo; dim = the others. Turning the Tempo knob while
-pressed doesn't count toward tap tempo. Mode switch **up**: the CHOMPI key records audio samples
-exactly as in TEMPO.
+hopped away from it with CHOMPI + Tempo; dim = the others. While the transport runs, each
+key pulses at its own subdivision's rate, so you can see how fast each one is. Turning
+the Tempo knob while pressed doesn't count toward tap tempo. Mode switch **up**: the
+CHOMPI key records audio samples exactly as in TEMPO.
+
+**Tempo LEDs:** while the transport runs, the right LED above the Tempo knob pulses on
+every beat and the left one pulses at the current quantize subdivision (steady and dim
+when the grid is off). The pulse follows the loop's beats when there is a loop, and the
+clock from when you pressed Play (or the MIDI song position) when there isn't. Stopped,
+they show the tempo as in TEMPO.
 
 **Live quantize** (on by default): while the loop is running — recording, overdubbing,
 or just playing along — a note you play waits for the next line of the current grid
@@ -67,6 +75,21 @@ and when the grid is off.
 **Loop LED:** blinking red = armed, red = recording, pink = overdub, green = playing
 (dim when stopped), blinking yellow = note memory full.
 
+**Chroma key transpose:** in Chroma, the *stepped* pitch knob (CHOMPI + Pitch by default;
+the plain Pitch knob if `Pitch Quantize In Shift Menu` is `false`) moves the keys instead
+of re-pitching the sample. Each key plays, records and sends over MIDI its own note plus
+the transpose, so a transposed key sounds right *and* lands on the right MIDI note. The
+steps are TEMPO's: a fifth, then a fourth (0, +7, +12, +19, +24 …; 0, −5, −12, −17, −24 …),
+four detents per step, up to four octaves either way. The pitch knob's LED shows it: yellow
+toward red going up, blue toward purple going down; pressing the knob in the shift menu
+resets it to 0 along with the pitch. Only notes you play from then on are affected;
+notes already in the loop keep their pitch. The key LEDs follow the pitches: a looped note
+lights the key that would play that pitch *now*, so as you transpose down the pattern walks
+up the keyboard and off the top, and the other way round. The continuous pitch knob still
+re-pitches the sample (including reverse), MIDI-in notes are played as sent, and Slice is
+unchanged. The transpose is saved with presets (as a 12th value in `presets.json`, which
+stock TEMPO ignores) and with the A / B states.
+
 **MIDI:** incoming notes are recorded, and live-quantized, too. Notes you play on the keys
 are sent to MIDI out when they sound, and so is their loop playback; notes that came in
 over MIDI are not echoed back. In external-clock mode, MIDI Start restarts the loop on
@@ -75,6 +98,13 @@ first note's start snaps to the nearest beat of the incoming clock: played a lit
 early, it waits for that beat; a little late, it sounds right away and is recorded on
 the beat.
 
+**MIDI sync through:** in external-clock mode the incoming clock is passed on to MIDI
+out when `MIDI Clock Out` is on, and incoming Start / Stop are passed on when the
+transport option includes "out", so CHOMPI can receive sync and send it to the next
+device at the same time. To send sync without the keys, set `MIDI Note Out` to `false`:
+MIDI out then carries clock, Start / Stop and CCs, but no notes (`MIDI CC Out` still
+controls the CCs).
+
 ### options.json
 
 | Name | Values | Default |
@@ -82,6 +112,7 @@ the beat.
 | `Loop Quantize Grid` | grid at power-on, in notes per whole note: 4, 6 (1/4T), 8, 12 (1/8T), 16, 24 (1/16T), 32, 48 (1/32T), or 0 = off | 16 |
 | `Loop Quantize Strength` | 0–100 (%): how far each note start is pulled toward the grid | 100 |
 | `Loop Live Quantize` | `true`: while the loop runs, notes you play wait for the next grid line before they sound, and are recorded there. `false`: notes sound the moment you play them; your timing is recorded and pulled to the nearest grid line on playback | `true` |
+| `MIDI Note Out` | `false`: no note on / off messages on MIDI out (clock, Start / Stop and CCs are unaffected) | `true` |
 
 Note *lengths* are always kept exactly as you held them. With live quantize, a note's
 length counts from when it actually sounds, so if you let go before its grid line it
@@ -116,6 +147,17 @@ Please send back:
      count as just after it. If this happens a lot, a small allowance can fix it.)
    - Hold a key while the loop plays the same key. Your held note should keep sounding
      until you let go.
+   - Tempo LEDs: with the loop playing, does the right LED pulse on the beat and the left
+     one at the subdivision? If they're the other way round on your unit, say so (the
+     mapping is a guess). Press + turn Tempo and watch keys 1–8 pulse at their own rates.
+   - MIDI sync through (if you have two MIDI devices): clock CHOMPI from one and check the
+     other, on CHOMPI's MIDI out, follows. Then set `MIDI Note Out` to `false` and check it
+     still follows but no longer plays CHOMPI's notes.
+   - Transpose (Chroma): record a short loop, then CHOMPI + turn the pitch knob. The loop
+     should keep its pitch while new keys play transposed, and the lit keys should shift
+     along the keyboard (off the end after two octaves or so). Save a preset, change the
+     transpose, recall the preset: it should come back. Press the pitch knob in the shift
+     menu: back to 0.
    - Set `Loop Live Quantize` to `false`: notes sound the moment you play them and are
      pulled to the grid on the next pass.
    - MIDI sync (if you have a clock source): start/stop from the external device.
@@ -132,6 +174,11 @@ Please send back:
   each engine has 8 voices. A stacking option is planned.
 - In internal-clock mode the clock realigns to your first note to within one clock
   tick (1/24 beat), which affects the delay's sync and MIDI clock out by at most that.
+- Which of the two LEDs above the Tempo knob is "left" is a guess; swap them if needed.
+- Transpose is a single setting for Chroma (not per A / B state while you're in Slice —
+  switching A / B in Slice applies Chroma's saved transpose for that state too, as TEMPO
+  does for Chroma's other settings).
+- `Loop Live Quantize` and `MIDI Note Out` are set in `options.json` only (no gesture).
 
 ## Roadmap (agreed design)
 
@@ -174,13 +221,19 @@ Please send back:
 - `NoteLooper.h`: connects LoopCore to the engines, MIDI, clock, options, and the
   CHOMPI / Loop key gestures (fed from `ui.h`). Looped notes go to the engines as
   `Source::SEQUENCER`, live notes as `Source::USER` (like a key press), so the engines
-  keep a voice going while either wants it.
+  keep a voice going while either wants it. Holds the Chroma transpose and picks each
+  Chroma note's engine voice from its pitch (the key that plays it at the current
+  transpose), which is what moves the key LEDs.
+- `StateSaver.h` / `PresetManager.h`: stock files with one addition each, the transpose
+  (an A / B state field; preset value 11). The rest is unchanged.
 - `NormalPage.h` / `MidiManager.h`: plain notes (no arpeggiator) are handed to the
   looper to sound instead of being sent to the engines directly; the arpeggiator paths
   are unchanged and only record into the looper.
+- `OptionsManager.h`: the three looper options and `MIDI Note Out`, plus a guard so an
+  options.json with fewer entries (like stock TEMPO's) can't crash the parser.
+- `MidiManager.h`: besides routing notes to the looper, passes clock / Start / Stop
+  through in external-clock mode and drops note messages when `MIDI Note Out` is off.
 - `clockManager.h`: adds one shared timeline that advances on the internal timer or
   incoming MIDI clock, interpolated between ticks.
-- `OptionsManager.h`: the three looper options, plus a guard so an options.json with
-  fewer entries (like stock TEMPO's) can't crash the parser.
 - `tests/test_loopcore.cpp`: tests for LoopCore. The cloud build runs them before every
   firmware build, so a logic regression stops the build with a clear failure.

@@ -7,6 +7,10 @@
  *  live quantize they can wait for the next grid line. They still reach the engines
  *  in the same audio block as before when they don't have to wait.
  *
+ *  It also holds the Chroma key transpose (the stepped pitch knob, in fourths and
+ *  fifths) and maps every Chroma note to the key that plays that pitch at the current
+ *  transpose, so the key LEDs follow the pitches as you transpose.
+ *
  *  Threading: two contexts talk to the looper.
  *   - Main loop (UI pages): Queue...() calls only. They go through a FIFO.
  *   - Audio callback (ui.GenerateEvents, MidiManager, AudioCallback): everything else,
@@ -145,6 +149,53 @@ class NoteLooper : public looper::Output
         return grid_shown_ && daisy::System::GetNow() - grid_changed_ms_ < kGridShowMs;
     }
 
+    /** Where we are within the bar (0 .. kUnitsPerBar - 1), for the tempo and grid
+     *  LEDs. Follows the loop when there is one, otherwise the clock since it was
+     *  started. Updated once per audio block. */
+    int32_t BarPhaseUnits() const { return bar_phase_; }
+
+    // ------------- Chroma key transpose (main loop) -------------
+    //
+    // In Chroma the stepped pitch knob moves the keys instead of re-pitching the
+    // sample: a key plays (and sends over MIDI) its note plus the transpose. Steps
+    // alternate a fifth and a fourth, like TEMPO's stepped pitch, so two clicks make
+    // an octave: 0, +7, +12, +19, +24 ... and 0, -5, -12, -17, -24 ..., up to 4 octaves
+    // either way. Only notes you play from then on are affected.
+
+    static constexpr int kMaxTransposeSteps = 8;  // 4 octaves
+    static constexpr int kMaxTranspose      = 48; // semitones
+    static constexpr int kKnobTurnsPerStep  = 4;  // detents per step, as TEMPO's knob
+
+    int Transpose() const { return transpose_; }
+
+    /** Set the transpose outright (from a preset or an A / B state). */
+    void SetTranspose(int semis)
+    {
+        semis = semis < -kMaxTranspose ? -kMaxTranspose : (semis > kMaxTranspose ? kMaxTranspose : semis);
+        transpose_step_ = StepForSemis(semis);
+        transpose_      = static_cast<int8_t>(SemisForStep(transpose_step_));
+        knob_turns_     = 0;
+    }
+
+    /** Turn the stepped pitch knob in Chroma. */
+    void StepTranspose(int turns)
+    {
+        knob_turns_ += turns;
+        while(knob_turns_ >= kKnobTurnsPerStep)
+        {
+            knob_turns_ -= kKnobTurnsPerStep;
+            if(transpose_step_ < kMaxTransposeSteps)
+                transpose_step_++;
+        }
+        while(knob_turns_ <= -kKnobTurnsPerStep)
+        {
+            knob_turns_ += kKnobTurnsPerStep;
+            if(transpose_step_ > -kMaxTransposeSteps)
+                transpose_step_--;
+        }
+        transpose_ = static_cast<int8_t>(SemisForStep(transpose_step_));
+    }
+
     // ------------- audio callback side -------------
 
     /** A MIDI note in. sound: the looper sounds it (and stops it on the note-off);
@@ -252,9 +303,11 @@ class NoteLooper : public looper::Output
         if(!initialized_)
             return;
 
-        core_.SetSyncInfo(cm_->getClockMode() == SYNC, cm_->getBeatPhaseUnits());
+        const bool     sync     = cm_->getClockMode() == SYNC;
+        const uint32_t timeline = cm_->getTimelineUnits();
+        core_.SetSyncInfo(sync, cm_->getBeatPhaseUnits());
         core_.SetRecordGrid(ActiveGridIndex());
-        core_.Process(cm_->getTimelineUnits(), daisy::System::GetUs());
+        core_.Process(timeline, daisy::System::GetUs());
 
         while(!input_fifo_.IsEmpty())
         {
@@ -275,6 +328,21 @@ class NoteLooper : public looper::Output
             cm_->setNow(0);
             cm_->setNow(1);
             cm_->setNow(2);
+            clock_origin_units_ = timeline;
+        }
+
+        // bar phase for the LEDs: the loop's position, or the clock since it started
+        {
+            const looper::State st = core_.GetState();
+            int32_t p;
+            if(st == looper::State::RECORDING || st == looper::State::PLAYING
+               || st == looper::State::OVERDUB)
+                p = core_.GetPosition();
+            else
+                p = static_cast<int32_t>(
+                    timeline - (sync ? cm_->getSongOriginUnits() : clock_origin_units_));
+            p %= looper::kUnitsPerBar;
+            bar_phase_ = p < 0 ? p + looper::kUnitsPerBar : p;
         }
 
         // shift + hold Loop: clear
@@ -300,7 +368,7 @@ class NoteLooper : public looper::Output
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
-                                                        e.key,
+                                                        StartVoice(eng, e.key, e.note),
                                                         127.f,
                                                         KeyRequest::Source::SEQUENCER));
         if(!(e.flags & looper::kFlagFromMidi))
@@ -310,8 +378,11 @@ class NoteLooper : public looper::Output
     void LoopNoteOff(uint8_t engine, int8_t key, uint8_t note, bool from_midi) override
     {
         const uint8_t eng = engine > 1 ? 1 : engine;
-        engines_[eng]->request_fifo.PushBack(KeyRequest(
-            KeyRequest::Type::STOP, 0.f, key, 127.f, KeyRequest::Source::SEQUENCER));
+        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP,
+                                                        0.f,
+                                                        VoiceOf(eng, key, note),
+                                                        127.f,
+                                                        KeyRequest::Source::SEQUENCER));
         if(!from_midi)
             hw_->queueMidiNote(midi_ch_[eng], note, 127, NoteOff);
     }
@@ -324,7 +395,7 @@ class NoteLooper : public looper::Output
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
-                                                        e.key,
+                                                        StartVoice(eng, e.key, e.note),
                                                         127.f,
                                                         KeyRequest::Source::USER));
         if(!(e.flags & looper::kFlagFromMidi))
@@ -336,7 +407,7 @@ class NoteLooper : public looper::Output
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP,
                                                         static_cast<float>(e.nn),
-                                                        e.key,
+                                                        VoiceOf(eng, e.key, e.note),
                                                         127.f,
                                                         KeyRequest::Source::USER));
         if(!(e.flags & looper::kFlagFromMidi))
@@ -344,6 +415,57 @@ class NoteLooper : public looper::Output
     }
 
   private:
+    static constexpr int kLowestKeyNote  = 48; // MIDI note of key 1 (C3) in Chroma
+    static constexpr int kHighestKeyNote = 72; // MIDI note of key 15 (C5)
+
+    /** Transpose in semitones for a knob step: fifths and fourths, two steps an octave. */
+    static int SemisForStep(int step)
+    {
+        const int m = step < 0 ? -step : step;
+        const int t = 12 * (m / 2) + ((m & 1) ? (step > 0 ? 7 : 5) : 0);
+        return step < 0 ? -t : t;
+    }
+
+    /** The knob step nearest a transpose in semitones (inverse of SemisForStep). */
+    static int StepForSemis(int semis)
+    {
+        const int m = semis < 0 ? -semis : semis;
+        const int s = 2 * (m / 12) + ((m % 12) ? 1 : 0);
+        return semis < 0 ? -s : s;
+    }
+
+    /** The engine voice for a note. Slice: the key, as always. Chroma: the key that
+     *  plays this pitch at the current transpose, so its LED lights; a pitch no key
+     *  reaches right now gets a voice id of its own (no LED). */
+    int VoiceForNote(uint8_t engine, int8_t key, uint8_t note) const
+    {
+        if(engine != 0)
+            return key;
+        // Hardware::SwId of the key for each MIDI note from C3 to C5 (same order as
+        // ui.h's midi2key for those notes)
+        static const int8_t kKeyForNote[kHighestKeyNote - kLowestKeyNote + 1]
+            = {15, 7, 8, 12, 9, 10, 13, 11, 14, 16, 21, 17, 18, 22, 19, 23, 20, 24, 29, 25, 30, 26, 31, 27, 28};
+        const int n = static_cast<int>(note) - transpose_;
+        if(n >= kLowestKeyNote && n <= kHighestKeyNote)
+            return kKeyForNote[n - kLowestKeyNote];
+        return 200 + n + kMaxTranspose; // off the keyboard: unique, no LED (ids > 40)
+    }
+
+    /** Pick the voice for a note that starts now, and remember it for its note-off
+     *  (the transpose may change in between). */
+    int StartVoice(uint8_t engine, int8_t key, uint8_t note)
+    {
+        const int v = VoiceForNote(engine, key, note);
+        if(engine == 0)
+            chroma_voice_[note & 127] = static_cast<int16_t>(v);
+        return v;
+    }
+
+    int VoiceOf(uint8_t engine, int8_t key, uint8_t note) const
+    {
+        return engine == 0 ? chroma_voice_[note & 127] : key;
+    }
+
     /** options.json grid value (notes per whole note, 0 = off) -> grid index */
     static int8_t GridIndexFromNotes(uint8_t notes)
     {
@@ -375,6 +497,7 @@ class NoteLooper : public looper::Output
                 cm_->setNow(0);
                 cm_->setNow(1);
                 cm_->setNow(2);
+                clock_origin_units_ = cm_->getTimelineUnits();
             }
             if(transport_out_)
                 hw_->queueMidiTransport(midi_ch_[0], start);
@@ -398,6 +521,16 @@ class NoteLooper : public looper::Output
     volatile int8_t grid_offset_ = 0;
     uint32_t        grid_changed_ms_ = 0;
     bool            grid_shown_      = false;
+
+    // bar phase for the LEDs: set in the audio callback, read by the UI (main loop)
+    volatile int32_t bar_phase_          = 0;
+    uint32_t         clock_origin_units_ = 0; // timeline position the clock last started at
+
+    // Chroma key transpose: set from the UI (main loop), read in the audio callback
+    volatile int8_t transpose_      = 0; // semitones
+    int             transpose_step_ = 0; // knob steps from 0
+    int             knob_turns_     = 0; // detents toward the next step
+    int16_t         chroma_voice_[128] = {}; // engine voice used for each Chroma note
 
     // CHOMPI key gesture
     bool     chompi_down_;

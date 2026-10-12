@@ -14,6 +14,7 @@ struct Hit
     int8_t  key;
     bool    on;
     bool    live; // a note played by hand (LiveNoteOn / LiveNoteOff), not a looped one
+    uint8_t note;
 };
 
 struct Rec : Output
@@ -23,19 +24,19 @@ struct Rec : Output
     LoopCore        *core = nullptr;
     void LoopNoteOn(const Event &e) override
     {
-        hits.push_back({t_ms, core->GetPosition(), e.key, true, false});
+        hits.push_back({t_ms, core->GetPosition(), e.key, true, false, e.note});
     }
-    void LoopNoteOff(uint8_t, int8_t key, uint8_t, bool) override
+    void LoopNoteOff(uint8_t, int8_t key, uint8_t note, bool) override
     {
-        hits.push_back({t_ms, core->GetPosition(), key, false, false});
+        hits.push_back({t_ms, core->GetPosition(), key, false, false, note});
     }
     void LiveNoteOn(const Event &e) override
     {
-        hits.push_back({t_ms, core->GetPosition(), e.key, true, true});
+        hits.push_back({t_ms, core->GetPosition(), e.key, true, true, e.note});
     }
     void LiveNoteOff(const Event &e) override
     {
-        hits.push_back({t_ms, core->GetPosition(), e.key, false, true});
+        hits.push_back({t_ms, core->GetPosition(), e.key, false, true, e.note});
     }
 };
 
@@ -766,6 +767,58 @@ static void test_lost_release_is_cleaned_up()
     CHECK(s.core.GetNumLiveNotes() == 0, "nothing left sounding");
 }
 
+static void test_same_key_two_pitches()
+{
+    printf("-- one key recorded at two pitches (transposed): both notes get their own off\n");
+    Sim s;
+    s.core.SetRecordGrid(kGridOff); // keep the played timing
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 1, 0, 60, false, true); // key 1 at transpose 0: note 60
+    s.run_to(300);
+    s.core.NoteOff(1);
+    s.run_to(400);
+    s.core.NoteOn(0, 1, 12, 72, false, true); // key 1 again, transposed an octave: note 72
+    s.run_to(500);
+    s.core.NoteOff(1);
+    s.run_to(2000);
+    s.core.ChompiTap(s.timeline()); // 1 bar
+    // pass 2: note 60 plays at 2000 for 300 ms, note 72 at 2400 for 100 ms
+    s.run_to(2700);
+    size_t off60 = 0, off72 = 0;
+    for(auto &h : s.rec.hits)
+        if(!h.on && !h.live && h.t_ms >= 2000)
+            (h.note == 60 ? off60 : off72)++;
+    CHECK(off60 == 1 && off72 == 1, "an off for each pitch (60: %zu, 72: %zu)", off60, off72);
+}
+
+static void test_same_key_two_pitches_overlapping()
+{
+    printf("-- one key at two pitches, overlapping: the earlier pitch is still released\n");
+    Sim s;
+    s.core.SetRecordGrid(kGridOff);
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 1, 0, 60, false, true); // note 60, held 600 ms
+    s.run_to(300);
+    s.core.NoteOn(0, 1, 12, 72, false, true); // same key, note 72, while 60 still sounds
+    s.run_to(400);
+    s.core.NoteOff(1); // releases the most recent press (72)
+    s.run_to(600);
+    s.core.NoteOff(1); // releases 60 (its live note was superseded, so this is a no-op)
+    s.run_to(2000);
+    s.core.ChompiTap(s.timeline()); // 1 bar
+    s.run_to(2800);
+    // on playback: 60 from 2000 to 2600, 72 from 2300 to 2400. Both must end.
+    double off60 = -1, off72 = -1;
+    for(auto &h : s.rec.hits)
+        if(!h.on && !h.live && h.t_ms >= 2000)
+        {
+            if(h.note == 60 && off60 < 0) off60 = h.t_ms;
+            if(h.note == 72 && off72 < 0) off72 = h.t_ms;
+        }
+    CHECK(off72 >= 2399 && off72 <= 2401, "note 72 off at ~2400, got %.1f", off72);
+    CHECK(off60 >= 2599 && off60 <= 2601, "note 60 off at ~2600 (not lost), got %.1f", off60);
+}
+
 static void test_noteoff_return_values()
 {
     printf("-- NoteOff says whether LoopCore was sounding the note\n");
@@ -810,6 +863,8 @@ int main()
     test_held_note_and_looped_note_stay_apart();
     test_same_key_twice_newer_sets_length();
     test_lost_release_is_cleaned_up();
+    test_same_key_two_pitches();
+    test_same_key_two_pitches_overlapping();
     test_noteoff_return_values();
     printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);
     return failures ? 1 : 0;

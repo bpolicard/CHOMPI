@@ -338,6 +338,11 @@ namespace chompi
                     r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], idx);
                     g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], idx);
                     b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], idx);
+                    // LOOPER: the stepped knob transposes the Chroma keys; show it
+                    if (quantized_pitch_ && fx_->getEngine() == CHROMATIC && looper_
+                        && looper_->Transpose() != 0) {
+                        TransposeLedColor(looper_->Transpose(), r, g, b);
+                    }
                 }
                 else if(knob_page[0] == 1)
                 {
@@ -544,7 +549,13 @@ namespace chompi
                         if(page == 0) // stepped pitch
                         {
                             if (quantized_pitch_) {
-                                enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
+                                if (fx_->getEngine() == CHROMATIC && looper_) {
+                                    // LOOPER: in Chroma the stepped knob transposes the keys
+                                    looper_->StepTranspose(turns);
+                                }
+                                else {
+                                    enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
+                                }
                             }
                             else {
                                 enc_values[0][0] += inc;
@@ -669,6 +680,9 @@ namespace chompi
             presets_->SetValue(reduce, mode, slot, 8);          // sample rate reduction
             presets_->SetValue(loop, mode, slot, 9);            // loop
             presets_->SetValue(sustain, mode, slot, 10);         // sustain
+            // LOOPER: Chroma key transpose, in semitones (0 for Slice)
+            presets_->SetValue(mode == CHROMATIC && looper_ ? static_cast<float>(looper_->Transpose()) : 0.f,
+                               mode, slot, 11);
         }
 
         void SetVoiceSlot(size_t slot)
@@ -689,6 +703,9 @@ namespace chompi
                 reduce = presets_->getDefault(8);          // sample rate reduction
                 loop = presets_->getDefault(9);            // loop
                 sustain = presets_->getDefault(10);         // sustain
+                if (mode == CHROMATIC && looper_) {
+                    looper_->SetTranspose(0);              // LOOPER: transpose
+                }
             }
             else
             {
@@ -703,6 +720,10 @@ namespace chompi
                 reduce = presets_->GetValue(mode, slot, 8);          // sample rate reduction
                 loop = presets_->GetValue(mode, slot, 9);            // loop
                 sustain = presets_->GetValue(mode, slot, 10);         // sustain
+                if (mode == CHROMATIC && looper_) {                  // LOOPER: transpose
+                    const float t = presets_->GetValue(mode, slot, 11);
+                    looper_->SetTranspose(static_cast<int>(t + (t < 0.f ? -.5f : .5f)));
+                }
             }
             engines_[mode]->setGlobalPitchFree(enc_values[0][0]);
             engines_[mode]->setSampleVolume(enc_values[1][0]);
@@ -753,6 +774,9 @@ namespace chompi
                         engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);
                         engines_[fx_->getEngine()]->resetGlobalPitchQuant();
                         pre_quantized_amount = .5f;
+                        if (fx_->getEngine() == CHROMATIC && looper_) {
+                            looper_->SetTranspose(0); // LOOPER: back to the untransposed keys
+                        }
                     }
                     else if(page == 1)
                     {
@@ -1206,6 +1230,7 @@ namespace chompi
             default_state.play = false;
             default_state.latch_state = 0;
             default_state.arp_randomness = arp_randomness;
+            default_state.transpose = 0; // LOOPER
             default_state.sequence = {};
             for (size_t i = 0; i < StateSaver::StateSlot::LAST; ++i) {
                 state_->Save(i, &default_state, nullptr);
@@ -1237,6 +1262,7 @@ namespace chompi
             myState.play = arpSeq_->getPlay(eng);
             myState.latch_state = arpSeq_->getLatchType(eng);
             myState.arp_randomness = arp_randomness;
+            myState.transpose = (eng == CHROMATIC && looper_) ? static_cast<int8_t>(looper_->Transpose()) : 0; // LOOPER
             std::vector<NoteInfo> *seq = arpSeq_->getSequence(eng);
             size_t slot = eng * 2 + static_cast<size_t>(st);
             state_->Save(slot, &myState, seq);
@@ -1300,6 +1326,9 @@ namespace chompi
             arpSeq_->setLatchDirect(eng, state->latch_state);
             arpSeq_->setRandomness(state->arp_randomness, eng);
             clock_manager_->setDiv(eng, state->clock_div);
+            if (eng == CHROMATIC && looper_) {
+                looper_->SetTranspose(state->transpose); // LOOPER
+            }
         }
 
         void resetAfterRecording() {

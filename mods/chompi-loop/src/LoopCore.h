@@ -618,14 +618,15 @@ class LoopCore
         const uint32_t off = now_us_ + e.dur_us;
         const bool     midi = e.flags & kFlagFromMidi;
 
-        // Same key already scheduled: the voice was just retriggered, so it now
-        // follows the new note's length.
+        // Same pitch already scheduled: the voice was just retriggered, so it now
+        // follows the new note's length. (A voice is a pitch on an engine: with the
+        // Chroma transpose, one key can hold different pitches over time.)
         for(auto &p : pending_)
         {
-            if(p.active && p.key == e.key && p.engine == e.engine)
+            if(p.active && p.engine == e.engine && p.note == e.note)
             {
                 p.off_us = off;
-                p.note   = e.note;
+                p.key    = e.key;
                 return;
             }
         }
@@ -724,12 +725,12 @@ class LoopCore
 
     void StartLiveNote(LiveNote &n)
     {
-        // Another live note already sounding on this voice (same key, engine):
+        // Another live note already sounding on this voice (same pitch, engine):
         // this one retriggers the voice and takes it over, so the older note's
         // release mustn't cut it short. (Looped notes work the same way.)
         for(auto &o : live_notes_)
-            if(&o != &n && o.active && o.sounding && o.ev.key == n.ev.key
-               && o.ev.engine == n.ev.engine)
+            if(&o != &n && o.active && o.sounding && o.ev.engine == n.ev.engine
+               && o.ev.note == n.ev.note)
                 o.active = false;
 
         n.sounding = true;
