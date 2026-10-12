@@ -737,13 +737,15 @@ namespace chompi
                     // real keypress
                     if(!isRetriggering)
                     {
-                        // LOOPER: plain key presses are sounded by the looper, right away
-                        // or on the next grid line (live quantize), MIDI out included.
+                        // LOOPER: a plain key press (no arpeggiator) is sounded by the
+                        // looper: right away, or with live quantize on the next grid
+                        // line, MIDI out included. It also stops it when you let go.
                         // Remember which keys it took, so the release goes to it too.
-                        const bool via_looper = looper_ && looper_->PlaysKeys()
+                        const bool via_looper = looper_ && looper_->SoundsLiveNotes()
                                                 && !arpSeq_->getPlay(fx_->getEngine())
-                                                && !arpSeq_->getLatch();
-                        if (buttonID < kLooperKeySlots) {
+                                                && !arpSeq_->getLatch()
+                                                && !arpSeq_->getSustain();
+                        if (buttonID < kNumKeyIds) {
                             looper_owns_key_[buttonID] = via_looper;
                         }
 
@@ -770,9 +772,10 @@ namespace chompi
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOn);
                         }
 
-                        // LOOPER: record the key press (and sound it, if via_looper)
+                        // LOOPER: record the key press (and sound it, if it's the looper's)
                         if (looper_) {
-                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, key_map[buttonID]);
+                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, key_map[buttonID],
+                                                 via_looper);
                         }
                     }
                 }
@@ -780,9 +783,9 @@ namespace chompi
                 {
                     if(!isRetriggering)
                     {
-                        // LOOPER: if the looper sounded this key, it releases it too
+                        // LOOPER: if the looper is sounding this key, it stops it too
                         bool via_looper = false;
-                        if (buttonID < kLooperKeySlots) {
+                        if (buttonID < kNumKeyIds) {
                             via_looper = looper_owns_key_[buttonID];
                             looper_owns_key_[buttonID] = false;
                         }
@@ -800,7 +803,8 @@ namespace chompi
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOff);
                         }
 
-                        // LOOPER: record the key release (sets the note's length)
+                        // LOOPER: record the key release (sets the note's length, and
+                        // stops the note if the looper is sounding it)
                         if (looper_) {
                             looper_->QueueNoteOff(buttonID);
                         }
@@ -991,8 +995,9 @@ namespace chompi
         uint8_t midi_channel[kNumEngines] = {0, 0};
         bool switch_state = false;
         NoteLooper *looper_ = nullptr;
-        static constexpr uint16_t kLooperKeySlots = 64;
-        bool looper_owns_key_[kLooperKeySlots] = {};
+        // LOOPER: keys whose current press the looper is sounding (it stops them too)
+        static constexpr size_t kNumKeyIds = static_cast<size_t>(Hardware::SwId::SR_LAST);
+        bool looper_owns_key_[kNumKeyIds] = {};
         bool chompi_key_pressed = false;
         bool transport_held = false;
         uint8_t* knob_page;

@@ -2,6 +2,11 @@
  *  Connects LoopCore (the looper logic) to CHOMPI: the sample engines, MIDI out,
  *  the shared clock timeline, options.json, and the CHOMPI / Loop key gestures.
  *
+ *  Plain notes you play (keyboard or MIDI in, with no arpeggiator involved) are
+ *  sounded by the looper rather than sent straight to the engines, so that with
+ *  live quantize they can wait for the next grid line. They still reach the engines
+ *  in the same audio block as before when they don't have to wait.
+ *
  *  Threading: two contexts talk to the looper.
  *   - Main loop (UI pages): Queue...() calls only. They go through a FIFO.
  *   - Audio callback (ui.GenerateEvents, MidiManager, AudioCallback): everything else,
@@ -31,6 +36,7 @@ struct LooperInput
     int8_t  key;
     int8_t  nn;
     uint8_t note;
+    bool    sound; // NOTE_ON: the looper sounds the note (and stops it on NOTE_OFF)
 };
 
 class NoteLooper : public looper::Output
@@ -68,27 +74,35 @@ class NoteLooper : public looper::Output
         initialized_ = true;
     }
 
+    /** True once the looper is set up. From then on it sounds the plain notes you
+     *  play (no arpeggiator), so they can wait for the grid: callers hand those notes
+     *  to it with sound = true instead of starting / stopping the engines themselves. */
+    bool SoundsLiveNotes() const { return initialized_; }
+
     // ------------- main loop side (UI pages) -------------
 
-    void QueueNoteOn(uint8_t engine, int key, float nn, uint8_t note)
+    /** A key press. sound: the looper sounds it (and stops it on the release);
+     *  otherwise it's only recorded (something else is sounding it). */
+    void QueueNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool sound)
     {
         LooperInput in{LooperInput::Type::NOTE_ON,
                        engine,
                        static_cast<int8_t>(key),
                        static_cast<int8_t>(nn),
-                       note};
+                       note,
+                       sound};
         input_fifo_.PushBack(in);
     }
 
     void QueueNoteOff(int key)
     {
-        LooperInput in{LooperInput::Type::NOTE_OFF, 0, static_cast<int8_t>(key), 0, 0};
+        LooperInput in{LooperInput::Type::NOTE_OFF, 0, static_cast<int8_t>(key), 0, 0, false};
         input_fifo_.PushBack(in);
     }
 
     void QueuePlayToggle()
     {
-        LooperInput in{LooperInput::Type::PLAY_TOGGLE, 0, 0, 0, 0};
+        LooperInput in{LooperInput::Type::PLAY_TOGGLE, 0, 0, 0, 0, false};
         input_fifo_.PushBack(in);
     }
 
@@ -133,24 +147,21 @@ class NoteLooper : public looper::Output
 
     // ------------- audio callback side -------------
 
-    /** may_play: MidiManager would play this note itself (no arp / latch).
-     *  Returns true if the looper will sound it, because it has to wait for a grid
-     *  line; MidiManager must then not play it. Otherwise MidiManager plays it now,
-     *  with its velocity, as before. */
-    bool MidiNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool may_play)
+    /** A MIDI note in. sound: the looper sounds it (and stops it on the note-off);
+     *  otherwise it's only recorded (something else is sounding it). */
+    void MidiNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool sound)
     {
-        if(!initialized_)
-            return false;
-        return core_.NoteOn(engine,
-                            static_cast<int8_t>(key),
-                            static_cast<int8_t>(nn),
-                            note,
-                            true,
-                            may_play ? looper::LiveSound::kPlayIfDelayed
-                                     : looper::LiveSound::kAlreadySounding);
+        if(initialized_)
+            core_.NoteOn(engine,
+                         static_cast<int8_t>(key),
+                         static_cast<int8_t>(nn),
+                         note,
+                         true,
+                         sound);
     }
 
-    /** Returns true if the looper is sounding this note and will release it. */
+    /** A MIDI note off. Returns true if the looper is sounding that note and stops
+     *  it itself; false if the caller should stop it. */
     bool MidiNoteOff(int key)
     {
         return initialized_ && core_.NoteOff(static_cast<int8_t>(key));
@@ -250,11 +261,8 @@ class NoteLooper : public looper::Output
             const LooperInput in = input_fifo_.PopFront();
             switch(in.type)
             {
-                                case LooperInput::Type::NOTE_ON:
-                    // The looper sounds keyboard notes: right away, or on the next
-                    // grid line when live quantize applies. It also releases them.
-                    core_.NoteOn(in.engine, in.key, in.nn, in.note, false,
-                                 looper::LiveSound::kPlay);
+                case LooperInput::Type::NOTE_ON:
+                    core_.NoteOn(in.engine, in.key, in.nn, in.note, false, in.sound);
                     break;
                 case LooperInput::Type::NOTE_OFF: core_.NoteOff(in.key); break;
                 case LooperInput::Type::PLAY_TOGGLE: TogglePlay(); break;
@@ -280,8 +288,7 @@ class NoteLooper : public looper::Output
 
     // ------------- state for LEDs etc. -------------
 
-    /** True once the looper is set up: from then on it sounds plain key presses. */
-    bool          PlaysKeys() const { return initialized_; }
+    bool          IsRunning() const { return initialized_ && core_.IsRunning(); }
     looper::State GetState() const { return core_.GetState(); }
     bool          HasLoop() const { return core_.HasLoop(); }
     bool          IsFull() const { return core_.IsFull(); }
@@ -307,6 +314,33 @@ class NoteLooper : public looper::Output
             KeyRequest::Type::STOP, 0.f, key, 127.f, KeyRequest::Source::SEQUENCER));
         if(!from_midi)
             hw_->queueMidiNote(midi_ch_[eng], note, 127, NoteOff);
+    }
+
+    /** A note you played starts sounding. Sent as Source::USER, exactly like a key
+     *  press: the engines keep a voice going while either your hand (USER) or the
+     *  loop (SEQUENCER) wants it, so a looped note ending can't cut a held key. */
+    void LiveNoteOn(const looper::Event &e) override
+    {
+        const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
+                                                        static_cast<float>(e.nn),
+                                                        e.key,
+                                                        127.f,
+                                                        KeyRequest::Source::USER));
+        if(!(e.flags & looper::kFlagFromMidi))
+            hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOn);
+    }
+
+    void LiveNoteOff(const looper::Event &e) override
+    {
+        const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP,
+                                                        static_cast<float>(e.nn),
+                                                        e.key,
+                                                        127.f,
+                                                        KeyRequest::Source::USER));
+        if(!(e.flags & looper::kFlagFromMidi))
+            hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOff);
     }
 
   private:

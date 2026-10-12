@@ -13,6 +13,7 @@ struct Hit
     int32_t pos;
     int8_t  key;
     bool    on;
+    bool    live; // a note played by hand (LiveNoteOn / LiveNoteOff), not a looped one
 };
 
 struct Rec : Output
@@ -22,11 +23,19 @@ struct Rec : Output
     LoopCore        *core = nullptr;
     void LoopNoteOn(const Event &e) override
     {
-        hits.push_back({t_ms, core->GetPosition(), e.key, true});
+        hits.push_back({t_ms, core->GetPosition(), e.key, true, false});
     }
     void LoopNoteOff(uint8_t, int8_t key, uint8_t, bool) override
     {
-        hits.push_back({t_ms, core->GetPosition(), key, false});
+        hits.push_back({t_ms, core->GetPosition(), key, false, false});
+    }
+    void LiveNoteOn(const Event &e) override
+    {
+        hits.push_back({t_ms, core->GetPosition(), e.key, true, true});
+    }
+    void LiveNoteOff(const Event &e) override
+    {
+        hits.push_back({t_ms, core->GetPosition(), e.key, false, true});
     }
 };
 
@@ -76,6 +85,29 @@ struct Sim
             if(h.on && h.t_ms >= a && h.t_ms < b && (key < 0 || h.key == key))
                 v.push_back(h);
         return v;
+    }
+    // first note-on / note-off of a key at or after a time (-1 if none)
+    double first_on(int8_t key, double after = 0, int live = -1) const
+    {
+        for(auto &h : rec.hits)
+            if(h.on && h.key == key && h.t_ms >= after && (live < 0 || h.live == (live == 1)))
+                return h.t_ms;
+        return -1;
+    }
+    double first_off(int8_t key, double after = 0, int live = -1) const
+    {
+        for(auto &h : rec.hits)
+            if(!h.on && h.key == key && h.t_ms >= after && (live < 0 || h.live == (live == 1)))
+                return h.t_ms;
+        return -1;
+    }
+    size_t count(int8_t key, bool on, bool live) const
+    {
+        size_t n = 0;
+        for(auto &h : rec.hits)
+            if(h.key == key && h.on == on && h.live == live)
+                n++;
+        return n;
     }
 };
 
@@ -222,6 +254,8 @@ static void test_sync_snap()
         s.core.ChompiTap(s.timeline());
         s.core.NoteOn(0, 3, 0, 60, false);
         CHECK(s.core.GetPosition() == 50, "late note sits at +50, got %d", s.core.GetPosition());
+        CHECK(s.core.GetEvent(0).pos == 0, "late first note recorded on the beat, got %d",
+              s.core.GetEvent(0).pos);
     }
     {
         Sim s;
@@ -429,60 +463,19 @@ static void test_live_sync_early()
     CHECK(s.core.GetEvent(0).pos == 0, "snapped onto the beat, got %d", s.core.GetEvent(0).pos);
 }
 
-// ---------------- live voices: LoopCore sounds the notes you play ----------------
+// ---------------- live notes: LoopCore sounds the notes you play ----------------
 
-static double first_on(const Sim &s, int8_t key, double after = 0)
-{
-    for(auto &h : s.rec.hits)
-        if(h.on && h.key == key && h.t_ms >= after)
-            return h.t_ms;
-    return -1;
-}
-static double first_off(const Sim &s, int8_t key, double after = 0)
-{
-    for(auto &h : s.rec.hits)
-        if(!h.on && h.key == key && h.t_ms >= after)
-            return h.t_ms;
-    return -1;
-}
-
-/** A 1-bar loop starting at t=0, playing from t=2000 (pass 2). */
+/** A 1-bar loop starting at t=0, playing from t=2000 (pass 2). 120 BPM:
+ *  beat = 500 ms, 1/16 = 125 ms. */
 static void one_bar_loop(Sim &s)
 {
     s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 1, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 1, 0, 60, false, true);
     s.run_to(20);
     s.core.NoteOff(1);
     s.run_to(1990);
     s.core.ChompiTap(s.timeline()); // close: 1 bar
     s.run_to(2000);
-}
-
-static void test_live_hit_waits_for_next_line()
-{
-    printf("-- live hit: waits for the next grid line, sounds once, length kept\n");
-    Sim s;
-    one_bar_loop(s);
-    s.core.ChompiTap(s.timeline()); // overdub
-    // beat 2 of pass 2 is t=2500. Play 20 ms AFTER it: must wait for 2625.
-    s.run_to(2520);
-    CHECK(s.core.NoteOn(0, 5, 0, 60, false, LiveSound::kPlay), "LoopCore takes the note");
-    s.run_to(2580);
-    CHECK(first_on(s, 5) < 0, "silent before the grid line");
-    CHECK(s.core.NoteOff(5), "LoopCore releases the note"); // held 60 ms
-    s.run_to(2700);
-    auto h = s.ons_between(2500, 2700, 5);
-    CHECK(h.size() == 1, "sounds exactly once, got %zu", h.size());
-    if(h.size())
-        CHECK(h[0].t_ms >= 2624 && h[0].t_ms <= 2626, "on the next 16th, at %.1f", h[0].t_ms);
-    const double on = first_on(s, 5), off = first_off(s, 5);
-    CHECK(off - on > 58 && off - on < 62, "length as held (60 ms): %.1f", off - on);
-    CHECK(s.core.GetEvent(s.core.GetNumEvents() - 1).pos == kUnitsPerBeat + 192,
-          "recorded where it sounded");
-    // next pass: same place, once
-    s.run_to(4700);
-    auto n = s.ons_between(4500, 4700, 5);
-    CHECK(n.size() == 1 && n[0].t_ms >= 4624 && n[0].t_ms <= 4626, "next pass at 4625");
 }
 
 /** At 78.125 BPM the simulated clock moves exactly 1 unit per ms, so a hit can land
@@ -494,12 +487,44 @@ static void one_bar_loop_exact(Sim &s)
     s.bpm = 78.125;
     s.step(); // t=1
     s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 1, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 1, 0, 60, false, true);
     s.run_to(20);
     s.core.NoteOff(1);
     s.run_to(3060);
     s.core.ChompiTap(s.timeline()); // close: 1 bar
     s.run_to(3073);
+}
+
+static void test_live_hit_waits_for_next_line()
+{
+    printf("-- live hit: waits for the next grid line, sounds once, length kept\n");
+    Sim s;
+    one_bar_loop(s);
+    s.core.ChompiTap(s.timeline()); // overdub
+    // beat 2 of pass 2 is t=2500. Play 20 ms AFTER it: must wait for 2625.
+    s.run_to(2520);
+    s.core.NoteOn(0, 5, 0, 60, false, true);
+    s.run_to(2580);
+    CHECK(s.first_on(5) < 0, "silent before the grid line");
+    CHECK(s.core.NoteOff(5), "LoopCore stops the note it's sounding"); // held 60 ms
+    s.run_to(2700);
+    auto h = s.ons_between(2500, 2700, 5);
+    CHECK(h.size() == 1, "sounds exactly once, got %zu", h.size());
+    if(h.size())
+    {
+        CHECK(h[0].t_ms >= 2624 && h[0].t_ms <= 2626, "on the next 16th, at %.1f", h[0].t_ms);
+        CHECK(h[0].live, "sounded as a live note");
+    }
+    const double on = s.first_on(5), off = s.first_off(5);
+    CHECK(off - on > 58 && off - on < 62, "length as held (60 ms): %.1f", off - on);
+    CHECK(s.core.GetEvent(s.core.GetNumEvents() - 1).pos == kUnitsPerBeat + 192,
+          "recorded where it sounded");
+    CHECK(s.core.GetNumLiveNotes() == 0, "nothing left sounding");
+    // next pass: same place, once, as a looped note
+    s.run_to(4700);
+    auto n = s.ons_between(4500, 4700, 5);
+    CHECK(n.size() == 1 && n[0].t_ms >= 4624 && n[0].t_ms <= 4626 && !n[0].live,
+          "next pass at 4625 from the loop");
 }
 
 static void test_live_hit_on_the_line()
@@ -509,16 +534,16 @@ static void test_live_hit_on_the_line()
     one_bar_loop_exact(s);
     s.run_to(3841); // beat 2 of pass 2
     CHECK(s.core.GetPosition() == kUnitsPerBeat, "test setup: on beat 2 (%d)", s.core.GetPosition());
-    s.core.NoteOn(0, 6, 0, 60, false, LiveSound::kPlay);
-    CHECK(first_on(s, 6) == 3841, "immediate, at %.1f", first_on(s, 6));
+    s.core.NoteOn(0, 6, 0, 60, false, true);
+    CHECK(s.first_on(6) == 3841, "immediate, at %.1f", s.first_on(6));
     s.run_to(3881);
     s.core.NoteOff(6);
-    CHECK(first_off(s, 6) == 3881, "released on key up, at %.1f", first_off(s, 6));
+    CHECK(s.first_off(6) == 3881, "released on key up, at %.1f", s.first_off(6));
     // one unit (1 ms) late: waits a whole 1/16
     s.run_to(4034); // 1/16 line at 4033
-    s.core.NoteOn(0, 7, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 7, 0, 60, false, true);
     s.run_to(4300);
-    CHECK(first_on(s, 7) == 4225, "1 unit late -> next 16th (4225), at %.1f", first_on(s, 7));
+    CHECK(s.first_on(7) == 4225, "1 unit late -> next 16th (4225), at %.1f", s.first_on(7));
 }
 
 static void test_live_hit_while_playing_not_recorded()
@@ -528,25 +553,32 @@ static void test_live_hit_while_playing_not_recorded()
     one_bar_loop(s);
     const size_t n = s.core.GetNumEvents();
     s.run_to(2810); // 60 ms after the 16th at 2750 -> next is 2875
-    s.core.NoteOn(0, 7, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 7, 0, 60, false, true);
     s.run_to(2830);
     s.core.NoteOff(7);
     s.run_to(3000);
-    const double on = first_on(s, 7);
+    const double on = s.first_on(7);
     CHECK(on >= 2874 && on <= 2876, "on the next 16th, at %.1f", on);
     CHECK(s.core.GetNumEvents() == n, "nothing recorded");
 }
 
 static void test_live_quantize_off_is_immediate()
 {
-    printf("-- live quantize off: notes sound immediately\n");
+    printf("-- live quantize off: notes sound immediately, pulled to the grid on playback\n");
     Sim s;
     s.core.SetLiveQuantize(false);
     one_bar_loop(s);
-    s.run_to(2520);
-    s.core.NoteOn(0, 8, 0, 60, false, LiveSound::kPlay);
-    CHECK(first_on(s, 8) == 2520, "immediate, at %.1f", first_on(s, 8));
+    s.core.ChompiTap(s.timeline()); // overdub
+    s.run_to(2520);                 // 20 ms after beat 2
+    s.core.NoteOn(0, 8, 0, 60, false, true);
+    CHECK(s.first_on(8) == 2520, "immediate, at %.1f", s.first_on(8));
+    s.run_to(2560);
     s.core.NoteOff(8);
+    CHECK(s.first_off(8) == 2560, "released on key up, at %.1f", s.first_off(8));
+    // next pass: pulled back to the nearest 16th (beat 2, t=4500)
+    s.run_to(4700);
+    auto n = s.ons_between(4400, 4700, 8);
+    CHECK(n.size() == 1 && n[0].t_ms >= 4499 && n[0].t_ms <= 4501, "playback on beat 2");
 }
 
 static void test_grid_off_is_immediate()
@@ -556,26 +588,8 @@ static void test_grid_off_is_immediate()
     one_bar_loop(s);
     s.core.SetRecordGrid(kGridOff);
     s.run_to(2520);
-    s.core.NoteOn(0, 8, 0, 60, false, LiveSound::kPlay);
-    CHECK(first_on(s, 8) == 2520, "immediate, at %.1f", first_on(s, 8));
-}
-
-static void test_play_if_delayed()
-{
-    printf("-- MIDI style: LoopCore only takes notes that have to wait\n");
-    Sim s;
-    one_bar_loop_exact(s);
-    s.run_to(3841); // on a line: the caller plays it (keeps velocity)
-    CHECK(!s.core.NoteOn(0, 9, 0, 60, true, LiveSound::kPlayIfDelayed), "on the line: not taken");
-    CHECK(first_on(s, 9) < 0, "LoopCore didn't sound it");
-    s.run_to(3851);
-    CHECK(!s.core.NoteOff(9), "caller stops it too");
-    s.run_to(3861); // off the line: LoopCore holds it back until 4033
-    CHECK(s.core.NoteOn(0, 10, 0, 60, true, LiveSound::kPlayIfDelayed), "off the line: taken");
-    s.run_to(3900);
-    CHECK(s.core.NoteOff(10), "LoopCore stops it");
-    s.run_to(4100);
-    CHECK(first_on(s, 10) == 4033, "on the next 16th, at %.1f", first_on(s, 10));
+    s.core.NoteOn(0, 8, 0, 60, false, true);
+    CHECK(s.first_on(8) == 2520, "immediate, at %.1f", s.first_on(8));
 }
 
 static void test_transport_stopped_is_immediate()
@@ -583,11 +597,12 @@ static void test_transport_stopped_is_immediate()
     printf("-- transport stopped / no loop: notes sound immediately\n");
     Sim s;
     s.run_to(123);
-    CHECK(s.core.NoteOn(0, 11, 0, 60, false, LiveSound::kPlay), "taken");
-    CHECK(first_on(s, 11) == 123, "immediate");
+    s.core.NoteOn(0, 11, 0, 60, false, true);
+    CHECK(s.first_on(11) == 123, "immediate");
     s.run_to(200);
-    s.core.NoteOff(11);
-    CHECK(first_off(s, 11) == 200, "released on key up");
+    CHECK(s.core.NoteOff(11), "LoopCore stops it");
+    CHECK(s.first_off(11) == 200, "released on key up");
+    CHECK(s.core.GetNumLiveNotes() == 0, "nothing left sounding");
 }
 
 static void test_first_note_free_is_immediate()
@@ -597,23 +612,36 @@ static void test_first_note_free_is_immediate()
     s.run_to(77);
     s.core.ChompiTap(s.timeline());
     s.run_to(333);
-    s.core.NoteOn(0, 12, 0, 60, false, LiveSound::kPlay);
-    CHECK(first_on(s, 12) == 333, "immediate, at %.1f", first_on(s, 12));
+    s.core.NoteOn(0, 12, 0, 60, false, true);
+    CHECK(s.first_on(12) == 333, "immediate, at %.1f", s.first_on(12));
+    CHECK(s.core.GetEvent(0).pos == 0, "recorded on beat 1");
 }
 
-static void test_first_note_sync_early_waits()
+static void test_first_note_sync()
 {
-    printf("-- first note while armed (MIDI clock), early: waits for the beat\n");
-    Sim s;
-    s.core.SetSyncInfo(true, 700); // 68 units (~44 ms) before the beat
-    s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 13, 0, 60, false, LiveSound::kPlay);
-    s.run_to(30);
-    CHECK(first_on(s, 13) < 0, "not yet");
-    s.run_to(60);
-    const double on = first_on(s, 13);
-    CHECK(on >= 44 && on <= 46, "on the beat (~44 ms), at %.1f", on);
-    CHECK(s.core.GetEvent(0).pos == 0, "recorded on the beat");
+    printf("-- first note while armed (MIDI clock): early waits for the beat, late sounds now\n");
+    {
+        Sim s;
+        s.core.SetSyncInfo(true, 700); // 68 units (~44 ms) before the beat
+        s.core.ChompiTap(s.timeline());
+        s.core.NoteOn(0, 13, 0, 60, false, true);
+        s.run_to(30);
+        CHECK(s.first_on(13) < 0, "early: not yet");
+        s.run_to(60);
+        const double on = s.first_on(13);
+        CHECK(on >= 44 && on <= 46, "early: on the beat (~44 ms), at %.1f", on);
+        CHECK(s.core.GetEvent(0).pos == 0, "early: recorded on the beat");
+    }
+    {
+        Sim s;
+        s.run_to(10);
+        s.core.SetSyncInfo(true, 50); // 50 units (~33 ms) after the beat
+        s.core.ChompiTap(s.timeline());
+        s.core.NoteOn(0, 13, 0, 60, false, true);
+        CHECK(s.first_on(13) == 10, "late: sounds right away, at %.1f", s.first_on(13));
+        CHECK(s.core.GetEvent(0).pos == 0, "late: recorded on the beat (nearest), got %d",
+              s.core.GetEvent(0).pos);
+    }
 }
 
 static void test_released_before_line()
@@ -623,11 +651,11 @@ static void test_released_before_line()
     one_bar_loop(s);
     s.core.SetRecordGrid(0); // 1/4 notes
     s.run_to(2550); // 50 ms after beat 2 -> waits for beat 3 (3000)
-    s.core.NoteOn(0, 14, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 14, 0, 60, false, true);
     s.run_to(2580);
-    s.core.NoteOff(14); // held 30 ms
+    CHECK(s.core.NoteOff(14), "LoopCore stops it"); // held 30 ms
     s.run_to(3100);
-    const double on = first_on(s, 14), off = first_off(s, 14);
+    const double on = s.first_on(14), off = s.first_off(14);
     CHECK(on >= 2999 && on <= 3001, "on beat 3, at %.1f", on);
     CHECK(off - on > 28 && off - on < 32, "length as held (30 ms): %.1f", off - on);
 }
@@ -639,18 +667,20 @@ static void test_stop_while_waiting()
     one_bar_loop(s);
     s.core.SetRecordGrid(0);
     s.run_to(2550);
-    s.core.NoteOn(0, 15, 0, 60, false, LiveSound::kPlay); // held
-    s.core.NoteOn(0, 16, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 15, 0, 60, false, true); // held
+    s.core.NoteOn(0, 16, 0, 60, false, true);
     s.run_to(2560);
-    s.core.NoteOff(16);                                   // released
+    s.core.NoteOff(16);                       // released
     s.run_to(2600);
     s.core.Stop();
-    CHECK(first_on(s, 15) == 2600, "held note sounds at stop, at %.1f", first_on(s, 15));
+    CHECK(s.first_on(15) == 2600, "held note sounds at stop, at %.1f", s.first_on(15));
     s.run_to(3500);
-    CHECK(first_on(s, 16) < 0, "released note dropped");
+    CHECK(s.first_on(16) < 0, "released note dropped");
     s.core.NoteOff(15); // held 950 ms, sounding from 2600 -> released at 3550
     s.run_to(3600);
-    CHECK(first_off(s, 15) == 3550, "held length counted from when it sounded, at %.1f", first_off(s, 15));
+    CHECK(s.first_off(15) == 3550, "held length counted from when it sounded, at %.1f",
+          s.first_off(15));
+    CHECK(s.core.GetNumLiveNotes() == 0, "nothing left sounding");
 }
 
 static void test_tail_note_at_close()
@@ -658,13 +688,13 @@ static void test_tail_note_at_close()
     printf("-- note played just before the bar line while recording: one hit on the downbeat\n");
     Sim s;
     s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 1, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 1, 0, 60, false, true);
     s.run_to(20);
     s.core.NoteOff(1);
     s.run_to(1950);
     s.core.ChompiTap(s.timeline()); // close: 1 bar, ends at 2000
     s.run_to(1980);
-    s.core.NoteOn(0, 17, 0, 60, false, LiveSound::kPlay);
+    s.core.NoteOn(0, 17, 0, 60, false, true);
     s.run_to(1990);
     s.core.NoteOff(17);
     s.run_to(2100);
@@ -674,6 +704,82 @@ static void test_tail_note_at_close()
         CHECK(h[0].t_ms >= 1999 && h[0].t_ms <= 2001, "on the downbeat, at %.1f", h[0].t_ms);
     s.run_to(4100);
     CHECK(s.ons_between(3990, 4010, 17).size() == 1, "and on the next downbeat");
+}
+
+static void test_held_note_and_looped_note_stay_apart()
+{
+    printf("-- a held key and a looped note on the same key don't cut each other\n");
+    Sim s;
+    one_bar_loop(s); // key 1 loops on every downbeat (t~2000, ~4000, ...) for 20 ms
+    // hold key 1 by hand from just before the next downbeat until well after
+    s.run_to(3800);
+    s.core.SetRecordGrid(kGridOff); // so it sounds right away
+    s.core.NoteOn(0, 1, 0, 60, false, true);
+    CHECK(s.first_on(1, 3800, 1) == 3800, "live note on at 3800");
+    s.run_to(4300); // the looped note plays on the downbeat and ends 20 ms later
+    const double loop_on = s.first_on(1, 3990, 0), loop_off = s.first_off(1, 3990, 0);
+    CHECK(loop_on >= 3999 && loop_on <= 4002, "looped note plays on the downbeat, at %.1f", loop_on);
+    CHECK(loop_off - loop_on > 18 && loop_off - loop_on < 22,
+          "looped note ends 20 ms later with a loop-note off: %.1f", loop_off - loop_on);
+    CHECK(s.first_off(1, 3800, 1) < 0, "the held live note is still on");
+    s.core.NoteOff(1);
+    CHECK(s.first_off(1, 3800, 1) == 4300, "live note off only when the key comes up");
+}
+
+static void test_same_key_twice_newer_sets_length()
+{
+    printf("-- two quick presses of one key on the same grid line: newer sets the length\n");
+    Sim s;
+    one_bar_loop(s);
+    s.core.SetRecordGrid(0); // 1/4: both wait for beat 3 (t=3000)
+    s.run_to(2550);
+    s.core.NoteOn(0, 18, 0, 60, false, true);
+    s.run_to(2570);
+    s.core.NoteOff(18); // held 20 ms
+    s.run_to(2600);
+    s.core.NoteOn(0, 18, 0, 60, false, true);
+    s.run_to(2680);
+    s.core.NoteOff(18); // held 80 ms
+    s.run_to(3200);
+    auto on = s.ons_between(2999, 3003, 18);
+    CHECK(on.size() == 2 && on[0].t_ms == on[1].t_ms, "both start on beat 3 (one retrigger)");
+    CHECK(s.count(18, false, true) == 1, "stopped once, got %zu", s.count(18, false, true));
+    if(on.size())
+    {
+        const double len = s.first_off(18, on[0].t_ms, 1) - on[0].t_ms;
+        CHECK(len > 78 && len < 82, "lasts the newer press's 80 ms: %.1f", len);
+    }
+}
+
+static void test_lost_release_is_cleaned_up()
+{
+    printf("-- a key pressed again after its release went missing: no stuck note\n");
+    Sim s;
+    s.run_to(100);
+    s.core.NoteOn(0, 19, 0, 60, false, true); // its release never arrives
+    s.run_to(200);
+    s.core.NoteOn(0, 19, 0, 60, false, true); // pressed again
+    CHECK(s.count(19, false, true) == 1, "the old one was stopped first");
+    s.run_to(250);
+    CHECK(s.core.NoteOff(19), "the new one is stopped by LoopCore");
+    CHECK(s.count(19, true, true) == 2 && s.count(19, false, true) == 2, "every on has an off");
+    CHECK(s.core.GetNumLiveNotes() == 0, "nothing left sounding");
+}
+
+static void test_noteoff_return_values()
+{
+    printf("-- NoteOff says whether LoopCore was sounding the note\n");
+    Sim s;
+    s.core.ChompiTap(s.timeline());
+    s.core.NoteOn(0, 20, 0, 60, false); // sounded by something else (record only)
+    s.run_to(50);
+    CHECK(!s.core.NoteOff(20), "record-only note: caller stops it");
+    CHECK(!s.core.NoteOff(21), "unknown key: caller stops it");
+    s.core.NoteOn(0, 22, 0, 60, true, true); // a MIDI note LoopCore sounds (on the next 16th)
+    s.run_to(60);
+    CHECK(s.core.NoteOff(22), "LoopCore stops it");
+    s.run_to(300);
+    CHECK(s.count(22, true, true) == 1 && s.count(22, false, true) == 1, "one on, one off");
 }
 
 int main()
@@ -695,13 +801,16 @@ int main()
     test_live_hit_while_playing_not_recorded();
     test_live_quantize_off_is_immediate();
     test_grid_off_is_immediate();
-    test_play_if_delayed();
     test_transport_stopped_is_immediate();
     test_first_note_free_is_immediate();
-    test_first_note_sync_early_waits();
+    test_first_note_sync();
     test_released_before_line();
     test_stop_while_waiting();
     test_tail_note_at_close();
+    test_held_note_and_looped_note_stay_apart();
+    test_same_key_twice_newer_sets_length();
+    test_lost_release_is_cleaned_up();
+    test_noteoff_return_values();
     printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);
     return failures ? 1 : 0;
 }

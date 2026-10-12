@@ -7,6 +7,10 @@
  *  Positions are measured in "units": the 24 PPQN clock subdivided by 32,
  *  so one beat = 768 units. 768 divides evenly by every quantize grid we use
  *  (including triplets), which keeps all the timing math in integers.
+ *
+ *  LoopCore also sounds the notes you play by hand ("live notes"). That's what lets
+ *  live quantize hold a note back until the next grid line, so what you hear while
+ *  playing is what gets recorded.
  */
 #pragma once
 #include <cstddef>
@@ -23,7 +27,7 @@ constexpr int32_t  kMaxBars        = 60;
 constexpr int32_t  kMaxLength      = kMaxBars * kUnitsPerBar;
 constexpr size_t   kMaxEvents      = 1024;
 constexpr size_t   kMaxPendingOffs = 32;
-constexpr size_t   kMaxLiveVoices  = 24; // notes being played by hand right now
+constexpr size_t   kMaxLiveNotes   = 24;   // notes played by hand, sounding or about to
 constexpr uint32_t kMinNoteUs      = 1000; // shortest note we'll schedule (1 ms)
 
 /** Quantize grids, coarse to fine, alternating straight and triplet, then off.
@@ -48,16 +52,6 @@ constexpr uint8_t kFlagHeld     = 1 << 0; // key still held: length unknown, don
 constexpr uint8_t kFlagFromMidi = 1 << 1; // arrived over MIDI: don't echo to MIDI out
 constexpr uint8_t kFlagSnapped  = 1 << 2; // quantized when recorded (live): play pos as-is
 
-/** What NoteOn should do about the *sound* of a note played by hand. */
-enum class LiveSound : uint8_t
-{
-    kAlreadySounding, // the caller has already played it: just record it
-    kPlay,            // LoopCore plays it: right away, or on the next grid line when
-                      // live quantize is on. LoopCore also releases it.
-    kPlayIfDelayed,   // LoopCore plays it only if it has to wait for a grid line.
-                      // Otherwise the caller plays it now (keeps MIDI velocity).
-};
-
 struct Event
 {
     int32_t  pos;     // raw (unquantized) position from loop start, in units
@@ -77,10 +71,18 @@ class Output
 {
   public:
     virtual ~Output() {}
+
+    /** A looped note starts / stops. */
     virtual void LoopNoteOn(const Event &ev) = 0;
     virtual void
     LoopNoteOff(uint8_t engine, int8_t key, uint8_t note, bool from_midi)
         = 0;
+
+    /** A note played by hand starts / stops. Kept apart from looped notes: the
+     *  engines keep a voice going while either the hand or the loop wants it, so a
+     *  looped note ending never cuts off a key you're still holding. */
+    virtual void LiveNoteOn(const Event &ev)  = 0;
+    virtual void LiveNoteOff(const Event &ev) = 0;
 };
 
 class LoopCore
@@ -101,8 +103,8 @@ class LoopCore
         request_clock_reset_ = false;
         for(auto &p : pending_)
             p.active = false;
-        for(auto &v : live_voices_)
-            v.active = false;
+        for(auto &n : live_notes_)
+            n.active = false;
         live_seq_ = 0;
         ClearAll();
     }
@@ -121,8 +123,8 @@ class LoopCore
         strength_ = strength_pct < 0 ? 0 : (strength_pct > 100 ? 100 : strength_pct);
     }
 
-    /** true (default): while the loop is running, notes you play wait for the next
-     *  grid line before they sound, and are recorded on that line.
+    /** true (default): while the loop runs, a note you play waits for the next
+     *  grid line before it sounds, and is recorded on that line.
      *  false: notes sound the moment you play them; your timing is recorded as
      *  played and pulled to the grid on playback. */
     void SetLiveQuantize(bool live) { live_ = live; }
@@ -157,55 +159,64 @@ class LoopCore
         if(running_ && delta > 0)
             Advance(delta);
 
+        ReleaseDueLiveNotes();
         ServiceNoteOffs();
     }
 
     // ---------------- performance input ----------------
 
-    /** A note played by hand (keyboard or MIDI in).
-     *  Returns true if LoopCore will sound it and release it (see LiveSound);
-     *  the caller must then not play or stop it itself. */
-    bool NoteOn(uint8_t   engine,
-                int8_t    key,
-                int8_t    nn,
-                uint8_t   note,
-                bool      from_midi,
-                LiveSound sound = LiveSound::kAlreadySounding)
+    /** A note played by hand (keyboard or MIDI in). It's recorded while recording
+     *  or overdubbing.
+     *  sound = true: LoopCore also sounds it, and stops it after NoteOff. With live
+     *  quantize on and the loop running, it waits for the next grid line (a note
+     *  even slightly after a line waits for the following one) and is recorded
+     *  there; otherwise it sounds right away.
+     *  sound = false: something else is already sounding it (e.g. the arpeggiator). */
+    void NoteOn(uint8_t engine,
+                int8_t  key,
+                int8_t  nn,
+                uint8_t note,
+                bool    from_midi,
+                bool    sound = false)
     {
-        if(state_ == State::ARMED)
+        const bool first = state_ == State::ARMED;
+        if(first)
             BeginFirstPass();
 
-        // Live quantize: while the loop runs, the note waits for the next grid
-        // line (strictly forward: a hit just after a line waits for the next one).
-        const int32_t target = live_ ? PullForward(pos_, kGridUnits[record_grid_]) : pos_;
-        const bool    on_grid_clock
+        // Where the note belongs. With live quantize: the next grid line. The first
+        // note of a loop is beat 1, so it belongs at the loop start instead (with
+        // MIDI clock that's the nearest beat, which may be just behind it).
+        const int32_t g      = kGridUnits[record_grid_];
+        int32_t       target = pos_;
+        if(live_)
+            target = first ? PullTo(pos_, 0, g) : PullForward(pos_, g);
+
+        // While the loop runs, the note waits for the playhead to get there.
+        const bool grid_running
             = running_
               && (state_ == State::RECORDING || state_ == State::PLAYING
                   || state_ == State::OVERDUB);
-        const int32_t wait = live_ && on_grid_clock ? target - pos_ : 0;
+        const int32_t wait = grid_running && target > pos_ ? target - pos_ : 0;
 
-        const bool take
-            = sound == LiveSound::kPlay || (sound == LiveSound::kPlayIfDelayed && wait > 0);
-        if(take)
-            StartLiveVoice(engine, key, nn, note, from_midi, wait);
+        if(sound)
+            AddLiveNote(engine, key, nn, note, from_midi, wait);
 
         const bool recording
             = state_ == State::RECORDING || (state_ == State::OVERDUB && running_);
         if(!recording)
-            return take;
+            return;
 
         if(num_events_ >= kMaxEvents)
         {
             full_ = true;
-            return take;
+            return;
         }
 
-        int32_t p     = pos_;
+        int32_t p     = target;
         uint8_t flags = kFlagHeld | (from_midi ? kFlagFromMidi : 0);
         if(live_)
         {
-            // Stored on the grid line it sounds on. (Its length stays as played.)
-            p = target;
+            // Stored where it sounds. (Its length stays exactly as played.)
             if(state_ == State::OVERDUB)
                 p = Mod(p, len_); // a grid line at the loop end is the downbeat
             flags |= kFlagSnapped;
@@ -222,11 +233,11 @@ class LoopCore
         e.pass    = pass_;
         e.flags   = flags;
         e.grid    = static_cast<uint8_t>(record_grid_);
-        return take;
     }
 
-    /** Key released. Returns true if LoopCore was sounding this note (it will
-     *  release it); false if the caller should stop it itself. */
+    /** Key released. Returns true if LoopCore is sounding this note (it stops it
+     *  itself, as long after it started as the key was held); false if the
+     *  caller should stop it. */
     bool NoteOff(int8_t key)
     {
         // match the most recent held event for this key
@@ -242,34 +253,23 @@ class LoopCore
             }
         }
 
-        // the most recent live voice for this key that's still held
-        LiveVoice *v = nullptr;
-        for(auto &lv : live_voices_)
-            if(lv.active && !lv.released && lv.ev.key == key
-               && (!v || static_cast<int32_t>(lv.seq - v->seq) > 0))
-                v = &lv;
-        if(!v)
-            return false;
-
-        uint32_t held = now_us_ - v->press_us;
-        held          = held < kMinNoteUs ? kMinNoteUs : held;
-        if(!v->sounding)
+        // the live note on this key (there's at most one still held)
+        for(auto &n : live_notes_)
         {
-            // Released before its grid line: it still plays, for as long as it was held.
-            v->released  = true;
-            v->ev.dur_us = held;
+            if(!n.active || n.released || n.ev.key != key)
+                continue;
+            const uint32_t held = now_us_ - n.press_us;
+            n.held_us           = held < kMinNoteUs ? kMinNoteUs : held;
+            n.released          = true;
+            if(n.sounding)
+            {
+                n.off_us = n.start_us + n.held_us;
+                ReleaseDueLiveNotes(); // (right now, if it sounded from the press)
+            }
+            // Still waiting for its grid line: it plays when it gets there.
+            return true;
         }
-        else
-        {
-            // Sounding: it lasts as long as it was held, counted from when it started.
-            const uint32_t off = v->fire_us + held;
-            if(static_cast<int32_t>(off - now_us_) <= 0)
-                ReleaseNow(v->ev);
-            else
-                ScheduleOffAt(v->ev, off);
-            v->active = false;
-        }
-        return true;
+        return false;
     }
 
     // ---------------- controls ----------------
@@ -301,6 +301,7 @@ class LoopCore
     void Start(int32_t start_pos = 0)
     {
         running_ = true;
+        ResolveWaitingLiveNotes(); // the grid starts over
         if(state_ == State::PLAYING || state_ == State::OVERDUB)
         {
             if(start_pos > 0)
@@ -310,22 +311,13 @@ class LoopCore
         }
     }
 
-    /** Transport stop. Pauses everything and releases looper notes.
-     *  A held key still waiting for its grid line sounds now; one already
-     *  released is dropped. */
+    /** Transport stop. Pauses everything and releases looper notes. Live notes
+     *  you're holding keep sounding until you let go. */
     void Stop()
     {
         running_ = false;
         AllNotesOff();
-        for(auto &v : live_voices_)
-        {
-            if(!v.active || v.sounding)
-                continue;
-            if(v.released)
-                v.active = false;
-            else
-                SoundLiveVoice(v);
-        }
+        ResolveWaitingLiveNotes();
     }
 
     /** Remove the most recent recording pass. Undoing the first take clears the loop. */
@@ -359,6 +351,7 @@ class LoopCore
             state_ = State::PLAYING;
     }
 
+    /** Clear the loop. (Notes you're playing by hand carry on.) */
     void Clear()
     {
         AllNotesOff();
@@ -375,6 +368,16 @@ class LoopCore
     int32_t  GetPosition() const { return pos_; }
     size_t   GetNumEvents() const { return num_events_; }
     const Event &GetEvent(size_t i) const { return events_[i]; }
+
+    /** Notes played by hand that LoopCore is sounding or about to sound. */
+    size_t GetNumLiveNotes() const
+    {
+        size_t n = 0;
+        for(const auto &ln : live_notes_)
+            if(ln.active)
+                n++;
+        return n;
+    }
 
     /** True once after the first note in free-clock mode, so the clock can realign. */
     bool ConsumeClockResetRequest()
@@ -406,16 +409,18 @@ class LoopCore
         bool     active;
     };
 
-    /** A note played by hand that LoopCore is sounding (or about to). */
-    struct LiveVoice
+    /** A note played by hand that LoopCore is sounding, or will sound on a grid line. */
+    struct LiveNote
     {
-        Event    ev;       // key, nn, engine, note, flags. dur_us: length once released
-        uint32_t fire_odo; // odometer value at which it sounds (while !sounding)
-        uint32_t press_us; // when the key went down
-        uint32_t fire_us;  // when it started sounding
-        uint32_t seq;      // order of presses, to find the most recent
+        Event    ev;        // key, nn, engine, note, flags (the rest is unused)
+        uint32_t press_us;  // when the key went down
+        uint32_t start_odo; // odometer value at which it sounds (while waiting)
+        uint32_t start_us;  // when it started sounding
+        uint32_t held_us;   // how long the key was held (once released)
+        uint32_t off_us;    // when it stops (once released and sounding)
+        uint32_t seq;       // press order
         bool     sounding;
-        bool     released; // let go before it sounded
+        bool     released;
         bool     active;
     };
 
@@ -433,14 +438,6 @@ class LoopCore
         return d * g;
     }
 
-    /** Pull a position toward grid g by the quantize strength. g = 0: unchanged. */
-    int32_t Pull(int32_t p, int32_t g) const
-    {
-        if(g <= 0 || strength_ <= 0)
-            return p;
-        return p + ((RoundToGrid(p, g) - p) * strength_) / 100;
-    }
-
     /** Next multiple of g at or after p (works for negative positions too). */
     static int32_t CeilToGrid(int32_t p, int32_t g)
     {
@@ -448,73 +445,25 @@ class LoopCore
         return d * g;
     }
 
-    /** Pull a position forward toward the next line of grid g by the quantize
-     *  strength. Never moves it earlier. g = 0: unchanged. */
-    int32_t PullForward(int32_t p, int32_t g) const
+    /** Pull a position toward grid line `line` by the quantize strength.
+     *  g = 0 (grid off): unchanged. */
+    int32_t PullTo(int32_t p, int32_t line, int32_t g) const
     {
         if(g <= 0 || strength_ <= 0)
             return p;
-        return p + ((CeilToGrid(p, g) - p) * strength_) / 100;
+        return p + ((line - p) * strength_) / 100;
     }
 
-    // ---------------- live voices ----------------
-
-    void StartLiveVoice(uint8_t engine, int8_t key, int8_t nn, uint8_t note, bool from_midi, int32_t wait)
+    /** Pull a position toward the nearest line of grid g (playback quantize). */
+    int32_t Pull(int32_t p, int32_t g) const
     {
-        LiveVoice *v = nullptr;
-        for(auto &lv : live_voices_)
-            if(!lv.active)
-            {
-                v = &lv;
-                break;
-            }
-        if(!v)
-        {
-            // All in use (very unlikely): let go of the oldest and reuse it
-            v = &live_voices_[0];
-            for(auto &lv : live_voices_)
-                if(static_cast<int32_t>(lv.seq - v->seq) < 0)
-                    v = &lv;
-            if(v->sounding && out_)
-                out_->LoopNoteOff(v->ev.engine, v->ev.key, v->ev.note, v->ev.flags & kFlagFromMidi);
-        }
-
-        v->ev        = Event{};
-        v->ev.key    = key;
-        v->ev.nn     = nn;
-        v->ev.engine = engine;
-        v->ev.note   = note;
-        v->ev.flags  = from_midi ? kFlagFromMidi : 0;
-        v->ev.dur_us = kMinNoteUs;
-        v->press_us  = now_us_;
-        v->fire_odo  = odo_ + static_cast<uint32_t>(wait > 0 ? wait : 0);
-        v->seq       = ++live_seq_;
-        v->sounding  = false;
-        v->released  = false;
-        v->active    = true;
-        if(wait <= 0)
-            SoundLiveVoice(*v);
+        return g > 0 ? PullTo(p, RoundToGrid(p, g), g) : p;
     }
 
-    void SoundLiveVoice(LiveVoice &v)
+    /** Pull a position toward the next line of grid g, never earlier (live quantize). */
+    int32_t PullForward(int32_t p, int32_t g) const
     {
-        if(out_)
-            out_->LoopNoteOn(v.ev);
-        v.sounding = true;
-        v.fire_us  = now_us_;
-        if(v.released)
-        {
-            ScheduleOffAt(v.ev, now_us_ + v.ev.dur_us);
-            v.active = false;
-        }
-    }
-
-    /** Sound the live voices whose grid line the playhead has reached. */
-    void ServiceLiveVoices()
-    {
-        for(auto &v : live_voices_)
-            if(v.active && !v.sounding && static_cast<int32_t>(odo_ - v.fire_odo) >= 0)
-                SoundLiveVoice(v);
+        return g > 0 ? PullTo(p, CeilToGrid(p, g), g) : p;
     }
 
     void ClearAll()
@@ -599,7 +548,7 @@ class LoopCore
     void Advance(int32_t delta)
     {
         odo_ += static_cast<uint32_t>(delta);
-        ServiceLiveVoices();
+        StartDueLiveNotes();
 
         if(state_ == State::RECORDING)
         {
@@ -650,7 +599,7 @@ class LoopCore
             if(q <= from || q > to)
                 continue;
             // Don't replay a note right after it was played live
-            // (e.g. quantized a few ms later than it was played).
+            // (e.g. it was played a moment before the position it was recorded at).
             if(odo_ - e.rec_odo < fresh_window)
                 continue;
             PlayEvent(e);
@@ -664,11 +613,10 @@ class LoopCore
         ScheduleOff(e);
     }
 
-    void ScheduleOff(const Event &e) { ScheduleOffAt(e, now_us_ + e.dur_us); }
-
-    void ScheduleOffAt(const Event &e, uint32_t off)
+    void ScheduleOff(const Event &e)
     {
-        const bool midi = e.flags & kFlagFromMidi;
+        const uint32_t off = now_us_ + e.dur_us;
+        const bool     midi = e.flags & kFlagFromMidi;
 
         // Same key already scheduled: the voice was just retriggered, so it now
         // follows the new note's length.
@@ -699,16 +647,6 @@ class LoopCore
         *soonest = {off, e.key, e.engine, e.note, midi, true};
     }
 
-    /** Release a voice right away (and forget any release scheduled for it). */
-    void ReleaseNow(const Event &e)
-    {
-        for(auto &p : pending_)
-            if(p.active && p.key == e.key && p.engine == e.engine)
-                p.active = false;
-        if(out_)
-            out_->LoopNoteOff(e.engine, e.key, e.note, e.flags & kFlagFromMidi);
-    }
-
     void ServiceNoteOffs()
     {
         for(auto &p : pending_)
@@ -735,12 +673,129 @@ class LoopCore
         }
     }
 
+    // ---------------- live notes ----------------
+
+    void AddLiveNote(uint8_t engine, int8_t key, int8_t nn, uint8_t note, bool from_midi, int32_t wait)
+    {
+        // A key can only be down once. A note on it that's still held lost its
+        // release somewhere (or a MIDI note-on was repeated): let it go first.
+        for(auto &n : live_notes_)
+            if(n.active && !n.released && n.ev.key == key)
+                EndLiveNote(n);
+
+        LiveNote *slot = nullptr;
+        for(auto &n : live_notes_)
+        {
+            if(!n.active)
+            {
+                slot = &n;
+                break;
+            }
+        }
+        if(!slot)
+        {
+            // All in use (very unlikely): let go of the oldest
+            slot = &live_notes_[0];
+            for(auto &n : live_notes_)
+                if(static_cast<int32_t>(n.seq - slot->seq) < 0)
+                    slot = &n;
+            EndLiveNote(*slot);
+        }
+
+        LiveNote &n = *slot;
+        n.ev        = Event{};
+        n.ev.key    = key;
+        n.ev.nn     = nn;
+        n.ev.engine = engine;
+        n.ev.note   = note;
+        n.ev.flags  = from_midi ? kFlagFromMidi : 0;
+        n.press_us  = now_us_;
+        n.start_odo = odo_ + static_cast<uint32_t>(wait > 0 ? wait : 0);
+        n.start_us  = 0;
+        n.held_us   = 0;
+        n.off_us    = 0;
+        n.seq       = ++live_seq_;
+        n.sounding  = false;
+        n.released  = false;
+        n.active    = true;
+        if(wait <= 0)
+            StartLiveNote(n);
+    }
+
+    void StartLiveNote(LiveNote &n)
+    {
+        // Another live note already sounding on this voice (same key, engine):
+        // this one retriggers the voice and takes it over, so the older note's
+        // release mustn't cut it short. (Looped notes work the same way.)
+        for(auto &o : live_notes_)
+            if(&o != &n && o.active && o.sounding && o.ev.key == n.ev.key
+               && o.ev.engine == n.ev.engine)
+                o.active = false;
+
+        n.sounding = true;
+        n.start_us = now_us_;
+        if(n.released) // let go before its grid line: plays as long as it was held
+            n.off_us = now_us_ + n.held_us;
+        if(out_)
+            out_->LiveNoteOn(n.ev);
+    }
+
+    /** Stop a live note now (if it's sounding) and free its slot. */
+    void EndLiveNote(LiveNote &n)
+    {
+        if(n.active && n.sounding && out_)
+            out_->LiveNoteOff(n.ev);
+        n.active = false;
+    }
+
+    /** Sound the live notes whose grid line the playhead has reached. Oldest press
+     *  first, so when two presses of one key land together the newer one sets
+     *  the length (as with looped notes). */
+    void StartDueLiveNotes()
+    {
+        for(;;)
+        {
+            LiveNote *next = nullptr;
+            for(auto &n : live_notes_)
+                if(n.active && !n.sounding && static_cast<int32_t>(odo_ - n.start_odo) >= 0
+                   && (!next || static_cast<int32_t>(n.seq - next->seq) < 0))
+                    next = &n;
+            if(!next)
+                return;
+            StartLiveNote(*next);
+        }
+    }
+
+    /** Stop the live notes whose time is up. */
+    void ReleaseDueLiveNotes()
+    {
+        for(auto &n : live_notes_)
+            if(n.active && n.sounding && n.released
+               && static_cast<int32_t>(now_us_ - n.off_us) >= 0)
+                EndLiveNote(n);
+    }
+
+    /** The grid stopped or started over while live notes wait for a line: a note
+     *  whose key is still down sounds now; one already let go is dropped. */
+    void ResolveWaitingLiveNotes()
+    {
+        for(auto &n : live_notes_)
+        {
+            if(!n.active || n.sounding)
+                continue;
+            if(n.released)
+                n.active = false;
+            else
+                StartLiveNote(n);
+        }
+    }
+
     Output *out_;
 
     Event      events_[kMaxEvents];
     size_t     num_events_;
     PendingOff pending_[kMaxPendingOffs];
-    LiveVoice  live_voices_[kMaxLiveVoices];
+    LiveNote   live_notes_[kMaxLiveNotes];
     uint32_t   live_seq_;
 
     State    state_;

@@ -89,6 +89,14 @@ class MidiManager {
 
                         float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key - 36) : 0.f;
 
+                        // LOOPER: a plain note (no arpeggiator) is sounded by the looper:
+                        // right away, or with live quantize on the next grid line. It also
+                        // stops it on the note off. (The engines ignore velocity.)
+                        const bool via_looper = looper_ && looper_->SoundsLiveNotes()
+                                                && !arpSeq_->getPlay(fx_->getEngine())
+                                                && !arpSeq_->getLatch()
+                                                && !arpSeq_->getSustain();
+
                         if (arpSeq_->getPlay(fx_->getEngine())) {
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 key - 36, midi2key[key], event.data[1] + 1));
@@ -100,13 +108,15 @@ class MidiManager {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 transpose_nn, midi2key[key], event.data[1] + 1));
                         }
-                        else {
+                        else if (!via_looper) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 transpose_nn, midi2key[key], event.data[1] + 1));
                         }
 
+                        // LOOPER: record the note (and sound it, if it's the looper's)
                         if (looper_) {
-                            looper_->MidiNoteOn(fx_->getEngine(), midi2key[key], transpose_nn, event.data[0]);
+                            looper_->MidiNoteOn(fx_->getEngine(), midi2key[key], transpose_nn, event.data[0],
+                                                via_looper);
                         }
                     }
                     break;
@@ -119,17 +129,17 @@ class MidiManager {
 
                         float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key - 36) : 0.f;
 
-                        if (!arpSeq_->getSustain() && !arpSeq_->checkNotePlaying(transpose_nn)) {
+                        // LOOPER: record the release (sets the note's length). If the
+                        // looper is sounding this note, it stops it itself.
+                        const bool looper_stops = looper_ && looper_->MidiNoteOff(midi2key[key]);
+
+                        if (!looper_stops && !arpSeq_->getSustain() && !arpSeq_->checkNotePlaying(transpose_nn)) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP, 
                                 transpose_nn, midi2key[key], 127.f));
                         }
                         if (arpSeq_->getPlay(fx_->getEngine()) || (arpSeq_->getLatch() && !arpSeq_->getSustain())) {
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP, 
                                 transpose_nn, midi2key[key], 127.f));
-                        }
-
-                        if (looper_) {
-                            looper_->MidiNoteOff(midi2key[key]);
                         }
                     }
                     break;
