@@ -737,6 +737,16 @@ namespace chompi
                     // real keypress
                     if(!isRetriggering)
                     {
+                        // LOOPER: plain key presses are sounded by the looper, right away
+                        // or on the next grid line (live quantize), MIDI out included.
+                        // Remember which keys it took, so the release goes to it too.
+                        const bool via_looper = looper_ && looper_->PlaysKeys()
+                                                && !arpSeq_->getPlay(fx_->getEngine())
+                                                && !arpSeq_->getLatch();
+                        if (buttonID < kLooperKeySlots) {
+                            looper_owns_key_[buttonID] = via_looper;
+                        }
+
                         if (arpSeq_->getPlay(fx_->getEngine())) {
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
@@ -751,16 +761,16 @@ namespace chompi
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
 
                         }
-                        else {
+                        else if (!via_looper) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 transpose_nn, buttonID, 127.f));
                         }
                         
-                        if (!arpSeq_->getPlay(fx_->getEngine())) {
+                        if (!arpSeq_->getPlay(fx_->getEngine()) && !via_looper) {
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOn);
                         }
 
-                        // LOOPER: record the key press
+                        // LOOPER: record the key press (and sound it, if via_looper)
                         if (looper_) {
                             looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, key_map[buttonID]);
                         }
@@ -770,8 +780,15 @@ namespace chompi
                 {
                     if(!isRetriggering)
                     {
+                        // LOOPER: if the looper sounded this key, it releases it too
+                        bool via_looper = false;
+                        if (buttonID < kLooperKeySlots) {
+                            via_looper = looper_owns_key_[buttonID];
+                            looper_owns_key_[buttonID] = false;
+                        }
+
                         //regular key mode. Stop transpose_nn_ is 0 because you don't need it? Seems a bit weird
-                        if (!arpSeq_->getSustain() && !arpSeq_->checkNotePlaying(key_map[buttonID] - 60)) {
+                        if (!via_looper && !arpSeq_->getSustain() && !arpSeq_->checkNotePlaying(key_map[buttonID] - 60)) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP, 
                                 transpose_nn, buttonID, 127.f));
                         }
@@ -779,7 +796,7 @@ namespace chompi
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP, 
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
                         }
-                        if (!arpSeq_->getPlay(fx_->getEngine()) && !arpSeq_->getSustain()) {
+                        if (!via_looper && !arpSeq_->getPlay(fx_->getEngine()) && !arpSeq_->getSustain()) {
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], key_map[buttonID], 127, NoteOff);
                         }
 
@@ -974,6 +991,8 @@ namespace chompi
         uint8_t midi_channel[kNumEngines] = {0, 0};
         bool switch_state = false;
         NoteLooper *looper_ = nullptr;
+        static constexpr uint16_t kLooperKeySlots = 64;
+        bool looper_owns_key_[kLooperKeySlots] = {};
         bool chompi_key_pressed = false;
         bool transport_held = false;
         uint8_t* knob_page;

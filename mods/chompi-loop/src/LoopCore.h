@@ -23,6 +23,7 @@ constexpr int32_t  kMaxBars        = 60;
 constexpr int32_t  kMaxLength      = kMaxBars * kUnitsPerBar;
 constexpr size_t   kMaxEvents      = 1024;
 constexpr size_t   kMaxPendingOffs = 32;
+constexpr size_t   kMaxLiveVoices  = 24; // notes being played by hand right now
 constexpr uint32_t kMinNoteUs      = 1000; // shortest note we'll schedule (1 ms)
 
 /** Quantize grids, coarse to fine, alternating straight and triplet, then off.
@@ -46,6 +47,16 @@ enum class State : uint8_t
 constexpr uint8_t kFlagHeld     = 1 << 0; // key still held: length unknown, don't play yet
 constexpr uint8_t kFlagFromMidi = 1 << 1; // arrived over MIDI: don't echo to MIDI out
 constexpr uint8_t kFlagSnapped  = 1 << 2; // quantized when recorded (live): play pos as-is
+
+/** What NoteOn should do about the *sound* of a note played by hand. */
+enum class LiveSound : uint8_t
+{
+    kAlreadySounding, // the caller has already played it: just record it
+    kPlay,            // LoopCore plays it: right away, or on the next grid line when
+                      // live quantize is on. LoopCore also releases it.
+    kPlayIfDelayed,   // LoopCore plays it only if it has to wait for a grid line.
+                      // Otherwise the caller plays it now (keeps MIDI velocity).
+};
 
 struct Event
 {
@@ -90,6 +101,9 @@ class LoopCore
         request_clock_reset_ = false;
         for(auto &p : pending_)
             p.active = false;
+        for(auto &v : live_voices_)
+            v.active = false;
+        live_seq_ = 0;
         ClearAll();
     }
 
@@ -107,8 +121,10 @@ class LoopCore
         strength_ = strength_pct < 0 ? 0 : (strength_pct > 100 ? 100 : strength_pct);
     }
 
-    /** true: quantize note starts as they're recorded (default).
-     *  false: keep the played timing and quantize on playback. */
+    /** true (default): while the loop is running, notes you play wait for the next
+     *  grid line before they sound, and are recorded on that line.
+     *  false: notes sound the moment you play them; your timing is recorded as
+     *  played and pulled to the grid on playback. */
     void SetLiveQuantize(bool live) { live_ = live; }
 
     /** sync: following an external clock. beat_phase: units since the last beat line. */
@@ -146,29 +162,50 @@ class LoopCore
 
     // ---------------- performance input ----------------
 
-    void NoteOn(uint8_t engine, int8_t key, int8_t nn, uint8_t note, bool from_midi)
+    /** A note played by hand (keyboard or MIDI in).
+     *  Returns true if LoopCore will sound it and release it (see LiveSound);
+     *  the caller must then not play or stop it itself. */
+    bool NoteOn(uint8_t   engine,
+                int8_t    key,
+                int8_t    nn,
+                uint8_t   note,
+                bool      from_midi,
+                LiveSound sound = LiveSound::kAlreadySounding)
     {
         if(state_ == State::ARMED)
             BeginFirstPass();
 
+        // Live quantize: while the loop runs, the note waits for the next grid
+        // line (strictly forward: a hit just after a line waits for the next one).
+        const int32_t target = live_ ? PullForward(pos_, kGridUnits[record_grid_]) : pos_;
+        const bool    on_grid_clock
+            = running_
+              && (state_ == State::RECORDING || state_ == State::PLAYING
+                  || state_ == State::OVERDUB);
+        const int32_t wait = live_ && on_grid_clock ? target - pos_ : 0;
+
+        const bool take
+            = sound == LiveSound::kPlay || (sound == LiveSound::kPlayIfDelayed && wait > 0);
+        if(take)
+            StartLiveVoice(engine, key, nn, note, from_midi, wait);
+
         const bool recording
             = state_ == State::RECORDING || (state_ == State::OVERDUB && running_);
         if(!recording)
-            return;
+            return take;
 
         if(num_events_ >= kMaxEvents)
         {
             full_ = true;
-            return;
+            return take;
         }
 
         int32_t p     = pos_;
         uint8_t flags = kFlagHeld | (from_midi ? kFlagFromMidi : 0);
         if(live_)
         {
-            // Live quantize: the note sounds right away, but its start is stored
-            // on the grid. (Its length stays exactly as played.)
-            p = Pull(p, kGridUnits[record_grid_]);
+            // Stored on the grid line it sounds on. (Its length stays as played.)
+            p = target;
             if(state_ == State::OVERDUB)
                 p = Mod(p, len_); // a grid line at the loop end is the downbeat
             flags |= kFlagSnapped;
@@ -185,9 +222,12 @@ class LoopCore
         e.pass    = pass_;
         e.flags   = flags;
         e.grid    = static_cast<uint8_t>(record_grid_);
+        return take;
     }
 
-    void NoteOff(int8_t key)
+    /** Key released. Returns true if LoopCore was sounding this note (it will
+     *  release it); false if the caller should stop it itself. */
+    bool NoteOff(int8_t key)
     {
         // match the most recent held event for this key
         for(size_t i = num_events_; i-- > 0;)
@@ -198,9 +238,38 @@ class LoopCore
                 uint32_t dur = now_us_ - e.dur_us;
                 e.dur_us     = dur < kMinNoteUs ? kMinNoteUs : dur;
                 e.flags &= static_cast<uint8_t>(~kFlagHeld);
-                return;
+                break;
             }
         }
+
+        // the most recent live voice for this key that's still held
+        LiveVoice *v = nullptr;
+        for(auto &lv : live_voices_)
+            if(lv.active && !lv.released && lv.ev.key == key
+               && (!v || static_cast<int32_t>(lv.seq - v->seq) > 0))
+                v = &lv;
+        if(!v)
+            return false;
+
+        uint32_t held = now_us_ - v->press_us;
+        held          = held < kMinNoteUs ? kMinNoteUs : held;
+        if(!v->sounding)
+        {
+            // Released before its grid line: it still plays, for as long as it was held.
+            v->released  = true;
+            v->ev.dur_us = held;
+        }
+        else
+        {
+            // Sounding: it lasts as long as it was held, counted from when it started.
+            const uint32_t off = v->fire_us + held;
+            if(static_cast<int32_t>(off - now_us_) <= 0)
+                ReleaseNow(v->ev);
+            else
+                ScheduleOffAt(v->ev, off);
+            v->active = false;
+        }
+        return true;
     }
 
     // ---------------- controls ----------------
@@ -241,11 +310,22 @@ class LoopCore
         }
     }
 
-    /** Transport stop. Pauses everything and releases looper notes. */
+    /** Transport stop. Pauses everything and releases looper notes.
+     *  A held key still waiting for its grid line sounds now; one already
+     *  released is dropped. */
     void Stop()
     {
         running_ = false;
         AllNotesOff();
+        for(auto &v : live_voices_)
+        {
+            if(!v.active || v.sounding)
+                continue;
+            if(v.released)
+                v.active = false;
+            else
+                SoundLiveVoice(v);
+        }
     }
 
     /** Remove the most recent recording pass. Undoing the first take clears the loop. */
@@ -326,6 +406,19 @@ class LoopCore
         bool     active;
     };
 
+    /** A note played by hand that LoopCore is sounding (or about to). */
+    struct LiveVoice
+    {
+        Event    ev;       // key, nn, engine, note, flags. dur_us: length once released
+        uint32_t fire_odo; // odometer value at which it sounds (while !sounding)
+        uint32_t press_us; // when the key went down
+        uint32_t fire_us;  // when it started sounding
+        uint32_t seq;      // order of presses, to find the most recent
+        bool     sounding;
+        bool     released; // let go before it sounded
+        bool     active;
+    };
+
     static int32_t Mod(int32_t a, int32_t m)
     {
         int32_t r = a % m;
@@ -346,6 +439,82 @@ class LoopCore
         if(g <= 0 || strength_ <= 0)
             return p;
         return p + ((RoundToGrid(p, g) - p) * strength_) / 100;
+    }
+
+    /** Next multiple of g at or after p (works for negative positions too). */
+    static int32_t CeilToGrid(int32_t p, int32_t g)
+    {
+        const int32_t d = p >= 0 ? (p + g - 1) / g : -((-p) / g); // ceil(p / g)
+        return d * g;
+    }
+
+    /** Pull a position forward toward the next line of grid g by the quantize
+     *  strength. Never moves it earlier. g = 0: unchanged. */
+    int32_t PullForward(int32_t p, int32_t g) const
+    {
+        if(g <= 0 || strength_ <= 0)
+            return p;
+        return p + ((CeilToGrid(p, g) - p) * strength_) / 100;
+    }
+
+    // ---------------- live voices ----------------
+
+    void StartLiveVoice(uint8_t engine, int8_t key, int8_t nn, uint8_t note, bool from_midi, int32_t wait)
+    {
+        LiveVoice *v = nullptr;
+        for(auto &lv : live_voices_)
+            if(!lv.active)
+            {
+                v = &lv;
+                break;
+            }
+        if(!v)
+        {
+            // All in use (very unlikely): let go of the oldest and reuse it
+            v = &live_voices_[0];
+            for(auto &lv : live_voices_)
+                if(static_cast<int32_t>(lv.seq - v->seq) < 0)
+                    v = &lv;
+            if(v->sounding && out_)
+                out_->LoopNoteOff(v->ev.engine, v->ev.key, v->ev.note, v->ev.flags & kFlagFromMidi);
+        }
+
+        v->ev        = Event{};
+        v->ev.key    = key;
+        v->ev.nn     = nn;
+        v->ev.engine = engine;
+        v->ev.note   = note;
+        v->ev.flags  = from_midi ? kFlagFromMidi : 0;
+        v->ev.dur_us = kMinNoteUs;
+        v->press_us  = now_us_;
+        v->fire_odo  = odo_ + static_cast<uint32_t>(wait > 0 ? wait : 0);
+        v->seq       = ++live_seq_;
+        v->sounding  = false;
+        v->released  = false;
+        v->active    = true;
+        if(wait <= 0)
+            SoundLiveVoice(*v);
+    }
+
+    void SoundLiveVoice(LiveVoice &v)
+    {
+        if(out_)
+            out_->LoopNoteOn(v.ev);
+        v.sounding = true;
+        v.fire_us  = now_us_;
+        if(v.released)
+        {
+            ScheduleOffAt(v.ev, now_us_ + v.ev.dur_us);
+            v.active = false;
+        }
+    }
+
+    /** Sound the live voices whose grid line the playhead has reached. */
+    void ServiceLiveVoices()
+    {
+        for(auto &v : live_voices_)
+            if(v.active && !v.sounding && static_cast<int32_t>(odo_ - v.fire_odo) >= 0)
+                SoundLiveVoice(v);
     }
 
     void ClearAll()
@@ -430,6 +599,7 @@ class LoopCore
     void Advance(int32_t delta)
     {
         odo_ += static_cast<uint32_t>(delta);
+        ServiceLiveVoices();
 
         if(state_ == State::RECORDING)
         {
@@ -494,10 +664,11 @@ class LoopCore
         ScheduleOff(e);
     }
 
-    void ScheduleOff(const Event &e)
+    void ScheduleOff(const Event &e) { ScheduleOffAt(e, now_us_ + e.dur_us); }
+
+    void ScheduleOffAt(const Event &e, uint32_t off)
     {
-        const uint32_t off = now_us_ + e.dur_us;
-        const bool     midi = e.flags & kFlagFromMidi;
+        const bool midi = e.flags & kFlagFromMidi;
 
         // Same key already scheduled: the voice was just retriggered, so it now
         // follows the new note's length.
@@ -526,6 +697,16 @@ class LoopCore
         if(out_)
             out_->LoopNoteOff(soonest->engine, soonest->key, soonest->note, soonest->from_midi);
         *soonest = {off, e.key, e.engine, e.note, midi, true};
+    }
+
+    /** Release a voice right away (and forget any release scheduled for it). */
+    void ReleaseNow(const Event &e)
+    {
+        for(auto &p : pending_)
+            if(p.active && p.key == e.key && p.engine == e.engine)
+                p.active = false;
+        if(out_)
+            out_->LoopNoteOff(e.engine, e.key, e.note, e.flags & kFlagFromMidi);
     }
 
     void ServiceNoteOffs()
@@ -559,6 +740,8 @@ class LoopCore
     Event      events_[kMaxEvents];
     size_t     num_events_;
     PendingOff pending_[kMaxPendingOffs];
+    LiveVoice  live_voices_[kMaxLiveVoices];
+    uint32_t   live_seq_;
 
     State    state_;
     bool     running_;

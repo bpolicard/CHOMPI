@@ -133,16 +133,27 @@ class NoteLooper : public looper::Output
 
     // ------------- audio callback side -------------
 
-    void MidiNoteOn(uint8_t engine, int key, float nn, uint8_t note)
+    /** may_play: MidiManager would play this note itself (no arp / latch).
+     *  Returns true if the looper will sound it, because it has to wait for a grid
+     *  line; MidiManager must then not play it. Otherwise MidiManager plays it now,
+     *  with its velocity, as before. */
+    bool MidiNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool may_play)
     {
-        if(initialized_)
-            core_.NoteOn(engine, static_cast<int8_t>(key), static_cast<int8_t>(nn), note, true);
+        if(!initialized_)
+            return false;
+        return core_.NoteOn(engine,
+                            static_cast<int8_t>(key),
+                            static_cast<int8_t>(nn),
+                            note,
+                            true,
+                            may_play ? looper::LiveSound::kPlayIfDelayed
+                                     : looper::LiveSound::kAlreadySounding);
     }
 
-    void MidiNoteOff(int key)
+    /** Returns true if the looper is sounding this note and will release it. */
+    bool MidiNoteOff(int key)
     {
-        if(initialized_)
-            core_.NoteOff(static_cast<int8_t>(key));
+        return initialized_ && core_.NoteOff(static_cast<int8_t>(key));
     }
 
     /** External MIDI Start / Stop (only called when following MIDI transport). */
@@ -239,8 +250,11 @@ class NoteLooper : public looper::Output
             const LooperInput in = input_fifo_.PopFront();
             switch(in.type)
             {
-                case LooperInput::Type::NOTE_ON:
-                    core_.NoteOn(in.engine, in.key, in.nn, in.note, false);
+                                case LooperInput::Type::NOTE_ON:
+                    // The looper sounds keyboard notes: right away, or on the next
+                    // grid line when live quantize applies. It also releases them.
+                    core_.NoteOn(in.engine, in.key, in.nn, in.note, false,
+                                 looper::LiveSound::kPlay);
                     break;
                 case LooperInput::Type::NOTE_OFF: core_.NoteOff(in.key); break;
                 case LooperInput::Type::PLAY_TOGGLE: TogglePlay(); break;
@@ -266,7 +280,8 @@ class NoteLooper : public looper::Output
 
     // ------------- state for LEDs etc. -------------
 
-    bool          IsRunning() const { return initialized_ && core_.IsRunning(); }
+    /** True once the looper is set up: from then on it sounds plain key presses. */
+    bool          PlaysKeys() const { return initialized_; }
     looper::State GetState() const { return core_.GetState(); }
     bool          HasLoop() const { return core_.HasLoop(); }
     bool          IsFull() const { return core_.IsFull(); }
