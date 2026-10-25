@@ -231,6 +231,10 @@ namespace chompi
                             looper_->OnChompiKey(false, toggle_state, false);
                         else if (i == static_cast<int>(Hardware::SwId::KEY_28))
                             looper_->OnLoopKey(false);
+                        else if (i == static_cast<int>(Hardware::SwId::KEY_27))
+                            looper_->OnPlayKey(false);
+                        else if (IsKey(i) && looper_->OnKeyEdge(i, false))
+                            continue; // the looper took this key (step view note selection)
                     }
 
                     event_queue.AddButtonReleased(i);
@@ -259,8 +263,17 @@ namespace chompi
                             looper_->OnChompiKey(true, toggle_state, opened_menu);
                         else if (i == static_cast<int>(Hardware::SwId::KEY_28))
                             looper_->OnLoopKey(true);
-                        else if (IsPlayableControl(i))
+                        else if (i == static_cast<int>(Hardware::SwId::KEY_27))
+                        {
                             looper_->OnOtherInput();
+                            looper_->OnPlayKey(true);
+                        }
+                        else if (IsPlayableControl(i))
+                        {
+                            looper_->OnOtherInput();
+                            if (IsKey(i) && looper_->OnKeyEdge(i, true))
+                                continue; // while Play + Loop are held, keys only choose notes
+                        }
                     }
 
                     event_queue.AddButtonPressed(i, 1);
@@ -306,7 +319,7 @@ namespace chompi
                                     enc_defaults[0][1], enc_defaults[1][1],
                                     enc_defaults[0][2], enc_defaults[1][2],
                                     .5f, 0.f, 1.f, 1.f,
-                                    0.f}; // LOOPER: Chroma key transpose
+                                    0.f}; // LOOPER: Chroma transpose
 
             presets_manager->Init(defaults);
 
@@ -423,6 +436,12 @@ namespace chompi
                 && i != static_cast<int>(Hardware::SwId::NC_5)
                 && i != static_cast<int>(Hardware::SwId::NC_6)
                 && i != static_cast<int>(Hardware::SwId::SW_TOG);
+        }
+
+        /** LOOPER: one of the 25 keys */
+        static bool IsKey(int i)
+        {
+            return i >= NoteLooper::kFirstKey && i <= NoteLooper::kLastKey;
         }
 
         NoteLooper *looper_ = nullptr;

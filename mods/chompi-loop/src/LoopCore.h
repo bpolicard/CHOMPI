@@ -11,6 +11,9 @@
  *  LoopCore also sounds the notes you play by hand ("live notes"). That's what lets
  *  live quantize hold a note back until the next grid line, so what you hear while
  *  playing is what gets recorded.
+ *
+ *  The step view edits the loop directly: InsertNote / EraseRange / HasNotesIn /
+ *  StepMask, each edit as its own undo layer (BeginEditPass).
  */
 #pragma once
 #include <cstddef>
@@ -51,17 +54,19 @@ enum class State : uint8_t
 constexpr uint8_t kFlagHeld     = 1 << 0; // key still held: length unknown, don't play yet
 constexpr uint8_t kFlagFromMidi = 1 << 1; // arrived over MIDI: don't echo to MIDI out
 constexpr uint8_t kFlagSnapped  = 1 << 2; // quantized when recorded (live): play pos as-is
+constexpr uint8_t kFlagErased   = 1 << 3; // erased from the step view: silent until undone
 
 struct Event
 {
     int32_t  pos;     // raw (unquantized) position from loop start, in units
-    uint32_t rec_odo; // playhead odometer when recorded (prevents instant double hits)
+    uint32_t rec_odo; // playhead odometer when recorded (prevents instant double hits).
+                      // While kFlagErased is set: the pass the note belonged to.
     uint32_t dur_us;  // note length in µs. While kFlagHeld is set: the note-on time.
     int8_t   key;     // engine voice id (Hardware::SwId value)
     int8_t   nn;      // transpose in semitones
     uint8_t  engine;  // 0 = chroma, 1 = slice
     uint8_t  note;    // MIDI note number, for MIDI out
-    uint16_t pass;    // recording pass number, for undo
+    uint16_t pass;    // recording pass number, for undo (an erased note: the erasing pass)
     uint8_t  flags;
     uint8_t  grid;    // quantize grid (index into kGridUnits) when this note was played
 };
@@ -320,7 +325,8 @@ class LoopCore
         ResolveWaitingLiveNotes();
     }
 
-    /** Remove the most recent recording pass. Undoing the first take clears the loop. */
+    /** Remove the most recent recording pass (or step edit). Notes that pass erased
+     *  come back. Undoing the first take clears the loop. */
     void Undo()
     {
         if(state_ == State::ARMED || state_ == State::RECORDING)
@@ -329,11 +335,7 @@ class LoopCore
             return;
         }
 
-        uint16_t last = 0;
-        for(size_t i = 0; i < num_events_; i++)
-            if(events_[i].pass > last)
-                last = events_[i].pass;
-
+        const uint16_t last = MaxPass();
         if(last <= 1)
         {
             Clear();
@@ -342,8 +344,19 @@ class LoopCore
 
         size_t w = 0;
         for(size_t r = 0; r < num_events_; r++)
-            if(events_[r].pass != last)
-                events_[w++] = events_[r];
+        {
+            Event e = events_[r];
+            if(e.pass == last)
+            {
+                if(!(e.flags & kFlagErased))
+                    continue; // a note of the undone pass: gone
+                // a note the undone pass erased: back, in its own layer
+                e.flags &= static_cast<uint8_t>(~kFlagErased);
+                e.pass    = static_cast<uint16_t>(e.rec_odo);
+                e.rec_odo = odo_ - static_cast<uint32_t>(len_);
+            }
+            events_[w++] = e;
+        }
         num_events_ = w;
         full_       = false;
         pass_       = last - 1;
@@ -356,6 +369,126 @@ class LoopCore
     {
         AllNotesOff();
         ClearAll();
+    }
+
+    // ---------------- step view edits ----------------
+
+    /** Make sure there's a loop to edit. With none, create an empty 1-bar loop and
+     *  play it. If the transport is already running, the loop started at the last
+     *  bar line (phase = units since it); otherwise it starts now, as a first note
+     *  would (realigning the internal clock). */
+    void EnsureLoop(int32_t phase)
+    {
+        if(state_ != State::EMPTY && state_ != State::ARMED)
+            return;
+        if(running_)
+        {
+            pass_ = 1;
+            pos_  = phase < 0 ? 0 : Mod(phase, kUnitsPerBar);
+        }
+        else
+            BeginFirstPass();
+        num_events_          = 0;
+        full_                = false;
+        len_                 = kUnitsPerBar;
+        state_               = State::PLAYING;
+        scan_from_           = pos_ - 1;
+        overdub_after_close_ = false;
+    }
+
+    /** Start a new undo layer for the edit(s) that follow. */
+    void BeginEditPass() { pass_ = MaxPass() + 1; }
+
+    /** Any note of this engine starting in [from, to)? */
+    bool HasNotesIn(uint8_t engine, int32_t from, int32_t to) const
+    {
+        for(size_t i = 0; i < num_events_; i++)
+        {
+            const Event &e = events_[i];
+            if(e.engine != engine || (e.flags & kFlagErased))
+                continue;
+            const int32_t q = Quantized(e);
+            if(q >= from && q < to)
+                return true;
+        }
+        return false;
+    }
+
+    /** Erase this engine's notes starting in [from, to). They're kept, silent, so
+     *  Undo can bring them back. Returns how many. */
+    size_t EraseRange(uint8_t engine, int32_t from, int32_t to)
+    {
+        size_t n = 0;
+        for(size_t i = 0; i < num_events_; i++)
+        {
+            Event &e = events_[i];
+            if(e.engine != engine || (e.flags & kFlagErased))
+                continue;
+            const int32_t q = Quantized(e);
+            if(q < from || q >= to)
+                continue;
+            e.rec_odo = e.pass; // remembered for Undo
+            e.pass    = pass_;
+            e.flags |= kFlagErased;
+            n++;
+        }
+        return n;
+    }
+
+    /** Add a note at a position in the loop (a step start), dur_us long. It plays
+     *  when the playhead gets there. Needs a loop (see EnsureLoop). */
+    bool InsertNote(uint8_t  engine,
+                    int8_t   key,
+                    int8_t   nn,
+                    uint8_t  note,
+                    int32_t  pos,
+                    uint32_t dur_us,
+                    uint8_t  grid)
+    {
+        if(state_ == State::EMPTY || state_ == State::ARMED)
+            return false;
+        if(num_events_ >= kMaxEvents)
+        {
+            full_ = true;
+            return false;
+        }
+        if(len_ > 0)
+            pos = Mod(pos, len_);
+        Event &e  = events_[num_events_++];
+        e.pos     = pos;
+        e.rec_odo = odo_ - static_cast<uint32_t>(len_); // never "just played live"
+        e.dur_us  = dur_us < kMinNoteUs ? kMinNoteUs : dur_us;
+        e.key     = key;
+        e.nn      = nn;
+        e.engine  = engine;
+        e.note    = note;
+        e.pass    = pass_;
+        e.flags   = kFlagSnapped;
+        e.grid    = grid;
+        return true;
+    }
+
+    /** One bit per step: bit i set if a note of this engine starts in
+     *  [from + i * step_units, from + (i + 1) * step_units). steps <= 32. */
+    uint32_t StepMask(uint8_t engine, int32_t from, int32_t step_units, int steps) const
+    {
+        if(step_units <= 0 || steps <= 0)
+            return 0;
+        if(steps > 32)
+            steps = 32;
+        const int32_t to = from + step_units * steps;
+        uint32_t      m  = 0;
+        for(size_t i = 0; i < num_events_; i++)
+        {
+            const Event &e = events_[i];
+            if(e.engine != engine || (e.flags & kFlagErased))
+                continue;
+            const int32_t q = Quantized(e);
+            if(q < from || q >= to)
+                continue;
+            m |= 1u << ((q - from) / step_units);
+        }
+        return m;
     }
 
     // ---------------- queries ----------------
@@ -464,6 +597,15 @@ class LoopCore
     int32_t PullForward(int32_t p, int32_t g) const
     {
         return g > 0 ? PullTo(p, CeilToGrid(p, g), g) : p;
+    }
+
+    uint16_t MaxPass() const
+    {
+        uint16_t m = 0;
+        for(size_t i = 0; i < num_events_; i++)
+            if(events_[i].pass > m)
+                m = events_[i].pass;
+        return m;
     }
 
     void ClearAll()
@@ -593,8 +735,8 @@ class LoopCore
         for(size_t i = 0; i < num_events_; i++)
         {
             const Event &e = events_[i];
-            if(e.flags & kFlagHeld)
-                continue; // still being held: length unknown
+            if(e.flags & (kFlagHeld | kFlagErased))
+                continue; // still being held (length unknown), or erased
             const int32_t q = Quantized(e);
             if(q <= from || q > to)
                 continue;
@@ -619,8 +761,7 @@ class LoopCore
         const bool     midi = e.flags & kFlagFromMidi;
 
         // Same pitch already scheduled: the voice was just retriggered, so it now
-        // follows the new note's length. (A voice is a pitch on an engine: with the
-        // Chroma transpose, one key can hold different pitches over time.)
+        // follows the new note's length. (A voice is a pitch on an engine.)
         for(auto &p : pending_)
         {
             if(p.active && p.engine == e.engine && p.note == e.note)

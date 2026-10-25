@@ -112,6 +112,16 @@ struct Sim
     }
 };
 
+/** Events that aren't erased (erased ones stay in the array for Undo). */
+static size_t live_events(const LoopCore &c)
+{
+    size_t n = 0;
+    for(size_t i = 0; i < c.GetNumEvents(); i++)
+        if(!(c.GetEvent(i).flags & kFlagErased))
+            n++;
+    return n;
+}
+
 static void test_basic_free()
 {
     printf("-- basic free-clock loop\n");
@@ -769,15 +779,15 @@ static void test_lost_release_is_cleaned_up()
 
 static void test_same_key_two_pitches()
 {
-    printf("-- one key recorded at two pitches (transposed): both notes get their own off\n");
+    printf("-- one key recorded at two pitches: both notes get their own off\n");
     Sim s;
     s.core.SetRecordGrid(kGridOff); // keep the played timing
     s.core.ChompiTap(s.timeline());
-    s.core.NoteOn(0, 1, 0, 60, false, true); // key 1 at transpose 0: note 60
+    s.core.NoteOn(0, 1, 0, 60, false, true); // key 1: note 60
     s.run_to(300);
     s.core.NoteOff(1);
     s.run_to(400);
-    s.core.NoteOn(0, 1, 12, 72, false, true); // key 1 again, transposed an octave: note 72
+    s.core.NoteOn(0, 1, 12, 72, false, true); // key 1 again, an octave up: note 72
     s.run_to(500);
     s.core.NoteOff(1);
     s.run_to(2000);
@@ -835,6 +845,88 @@ static void test_noteoff_return_values()
     CHECK(s.count(22, true, true) == 1 && s.count(22, false, true) == 1, "one on, one off");
 }
 
+// ---------------- step view edits ----------------
+
+static void test_step_insert_erase_undo()
+{
+    printf("-- step view: insert a note, erase a step, undo both\n");
+    Sim s;
+    one_bar_loop(s); // key 1 on the downbeat (pass 1); pass 2 from t=2000
+    const int32_t g = kGridUnits[kGridSixteenth];
+    // place key 5 on beat 3 (step 8) for one 16th (125 ms)
+    s.core.BeginEditPass();
+    CHECK(s.core.InsertNote(0, 5, 0, 64, 8 * g, 125000, kGridSixteenth), "inserted");
+    CHECK(s.core.HasNotesIn(0, 8 * g, 9 * g), "step 8 has a note");
+    CHECK(!s.core.HasNotesIn(1, 8 * g, 9 * g), "not for the other engine");
+    CHECK(!s.core.HasNotesIn(0, 9 * g, 10 * g), "step 9 is empty");
+    CHECK(s.core.StepMask(0, 0, g, 16) == ((1u << 0) | (1u << 8)), "mask: steps 0 and 8, got %x",
+          s.core.StepMask(0, 0, g, 16));
+    CHECK(s.core.StepMask(1, 0, g, 16) == 0, "other engine: nothing");
+    s.run_to(3200);
+    const double on = s.first_on(5), off = s.first_off(5);
+    CHECK(on >= 2999 && on <= 3001, "plays on beat 3 of this pass, at %.1f", on);
+    CHECK(off - on > 123 && off - on < 127, "one 16th long: %.1f", off - on);
+    // next pass (downbeat at 4000): erase step 0, the recorded key 1
+    s.run_to(4200);
+    s.core.BeginEditPass();
+    CHECK(s.core.EraseRange(0, 0, g) == 1, "erased one note");
+    CHECK(s.core.StepMask(0, 0, g, 16) == (1u << 8), "mask after the erase");
+    CHECK(live_events(s.core) == 1 && s.core.GetNumEvents() == 2, "erased note kept, silent");
+    s.run_to(6200);
+    CHECK(s.ons_between(5990, 6010, 1).empty(), "erased note silent on the next pass");
+    CHECK(s.ons_between(4990, 5010, 5).size() == 1, "inserted note still plays");
+    s.core.Undo(); // the erase
+    CHECK(s.core.StepMask(0, 0, g, 16) == ((1u << 0) | (1u << 8)), "undo brings the erased note back");
+    s.run_to(8200);
+    CHECK(s.ons_between(7990, 8010, 1).size() == 1, "restored note plays again");
+    s.core.Undo(); // the insert
+    CHECK(s.core.StepMask(0, 0, g, 16) == (1u << 0), "undo removes the inserted note, not the take");
+    CHECK(live_events(s.core) == 1, "one note left");
+    CHECK(s.core.GetState() == State::PLAYING, "still a loop");
+    s.core.Undo(); // the take
+    CHECK(s.core.GetState() == State::EMPTY, "undoing the take clears");
+}
+
+static void test_step_view_creates_a_loop()
+{
+    printf("-- step view with no loop: the first placed note makes a 1-bar loop\n");
+    const int32_t g = kGridUnits[kGridSixteenth];
+    { // transport stopped: the loop starts now, like a first note would
+        Sim s;
+        s.run_to(100);
+        CHECK(!s.core.IsRunning(), "test setup: stopped");
+        s.core.EnsureLoop(0);
+        CHECK(s.core.GetState() == State::PLAYING && s.core.GetLength() == kUnitsPerBar
+                  && s.core.IsRunning() && s.core.GetPosition() == 0,
+              "1-bar loop, playing from its start");
+        CHECK(s.core.ConsumeClockResetRequest(), "internal clock realigns to it");
+        s.core.BeginEditPass();
+        CHECK(s.core.InsertNote(0, 3, 0, 62, 4 * g, 100000, kGridSixteenth), "beat 2 placed");
+        CHECK(s.core.InsertNote(0, 4, 0, 63, 0, 100000, kGridSixteenth), "downbeat placed");
+        s.core.EnsureLoop(500); // a second call changes nothing
+        CHECK(s.core.GetLength() == kUnitsPerBar && live_events(s.core) == 2, "unchanged by EnsureLoop");
+        s.run_to(2200);
+        CHECK(s.ons_between(100, 103, 4).size() == 1, "downbeat note sounds right away");
+        CHECK(s.first_on(3) >= 599 && s.first_on(3) <= 601, "beat 2 at 600, at %.1f", s.first_on(3));
+        CHECK(s.ons_between(2099, 2102, 4).size() == 1, "downbeat again on the wrap");
+    }
+    { // transport running without a loop: the loop started at the last bar line
+        Sim s;
+        s.core.Start();
+        s.run_to(700); // 1075 units into the bar
+        s.core.EnsureLoop(1075);
+        CHECK(s.core.GetState() == State::PLAYING && s.core.GetPosition() == 1075,
+              "loop picks up the bar phase, pos %d", s.core.GetPosition());
+        CHECK(!s.core.ConsumeClockResetRequest(), "clock not touched");
+        s.core.BeginEditPass();
+        s.core.InsertNote(0, 6, 0, 65, 0, 100000, kGridSixteenth);
+        s.run_to(2100);
+        // the bar line is (3072 - 1075) units = 1300 ms away: t=2000
+        CHECK(s.first_on(6) >= 1999 && s.first_on(6) <= 2002, "plays on the bar line, at %.1f",
+              s.first_on(6));
+    }
+}
+
 int main()
 {
     test_live_snap();
@@ -866,6 +958,8 @@ int main()
     test_same_key_two_pitches();
     test_same_key_two_pitches_overlapping();
     test_noteoff_return_values();
+    test_step_insert_erase_undo();
+    test_step_view_creates_a_loop();
     printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);
     return failures ? 1 : 0;
 }

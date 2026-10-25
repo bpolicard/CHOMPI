@@ -139,7 +139,7 @@ namespace chompi
         return floor + (1.f - floor) * x * x;
     }
 
-    /** LOOPER: pitch-knob LED color while the Chroma keys are transposed:
+    /** LOOPER: pitch-knob LED color while Chroma is transposed:
      *  up = yellow toward red, down = blue toward purple, further = further along. */
     static void TransposeLedColor(int semis, float &r, float &g, float &b)
     {
@@ -184,6 +184,33 @@ namespace chompi
                 level *= LooperPulse(bar % units, units, .25f);
             }
             SetSmtLedFloat(led_map[static_cast<int>(grid_keys[g])], c[0] * level, c[1] * level, c[2] * level);
+        }
+        return true;
+    }
+
+    /** LOOPER: the step view. One key per step of the current grid, left to right:
+     *  white = a note of the current engine starts here, red = the playhead,
+     *  yellow = both. Everything is either full on or off. Keys past the page are
+     *  dark. Returns false and draws nothing when the step view is off. */
+    static bool DrawLooperSteps(const NoteLooper *lp)
+    {
+        if (!lp || !lp->InStepView()) {
+            return false;
+        }
+        for (size_t i = 7; i < 25 + 7; i++) {
+            SetSmtLed(led_map[i], 0, 0, 0);
+        }
+        const int n = lp->PageSteps();
+        const uint32_t mask = lp->StepMask();
+        const int play = lp->PlayStep();
+        for (int i = 0; i < n; i++) {
+            const bool note = (mask >> i) & 1u;
+            const bool here = i == play;
+            if (!note && !here) {
+                continue;
+            }
+            const float *c = note && here ? yellow : (here ? red : white);
+            SetSmtLedFloat(led_map[static_cast<int>(looper_ui::kKeyOrder[i])], c[0], c[1], c[2]);
         }
         return true;
     }
@@ -296,6 +323,11 @@ namespace chompi
                 freeze_pressed = false;
             }
 
+            // LOOPER: the step view shows the engine that's selected
+            if (looper_) {
+                looper_->SetViewEngine(fx_->getEngine());
+            }
+
             for(size_t i = 7; i < (25 + 7); i++)
             {
                 if (arpSeq_->isKeyPlaying(i) || (arpSeq_->isRestPlaying(i) && arpSeq_->getPlay(1) && fx_->getEngine() == SLICE)) {
@@ -321,6 +353,9 @@ namespace chompi
                 }
             }
 
+            // LOOPER: step view (replaces the key display while it's on)
+            DrawLooperSteps(looper_);
+
             // =========   encoders   =========
             for (int i = 0; i < 6; i++)
             {
@@ -340,7 +375,7 @@ namespace chompi
                         r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], idx);
                         g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], idx);
                         b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], idx);
-                        // LOOPER: the stepped knob transposes the Chroma keys; show it
+                        // LOOPER: the stepped knob transposes Chroma; show it
                         if (quantized_pitch_ && fx_->getEngine() == CHROMATIC && looper_
                             && looper_->Transpose() != 0) {
                             TransposeLedColor(looper_->Transpose(), r, g, b);
@@ -527,8 +562,12 @@ namespace chompi
 
             r = g = b = 0.f;
 
-            // LOOPER: teal while the loop / clock is running
-            if (looper_ && looper_->IsRunning()) {
+            // LOOPER: teal while the loop / clock is running; white in the step view
+            // (dim white when stopped in the step view)
+            if (looper_ && looper_->InStepView()) {
+                r = g = b = looper_->IsRunning() ? 1.f : .25f;
+            }
+            else if (looper_ && looper_->IsRunning()) {
                 r = teal[0];
                 g = teal[1];
                 b = teal[2];
@@ -722,10 +761,9 @@ namespace chompi
             // CC buttons
             case static_cast<uint16_t>(Hardware::SwId::KEY_27): // play
             {
-                // LOOPER: Play starts / stops the loop and the clock
-                if (rising && looper_) {
-                    looper_->QueuePlayToggle();
-                }
+                // LOOPER: Play starts / stops the loop and the clock on its release,
+                // and Play + Loop held for a second toggles the step view. Both are
+                // handled by NoteLooper (fed from ui.h), so nothing happens here.
                 last_arm_blink = System::GetNow();
 
                 break;
@@ -780,9 +818,28 @@ namespace chompi
 
             // keys
             default:
-                // LOOPER: in Chroma the stepped pitch knob transposes the keys (NoteLooper)
+            {
+                // LOOPER: in the step view the keys edit the loop instead of playing.
+                // A key that was already sounding when the view opened is still
+                // released below.
+                if (looper_ && looper_->InStepView()) {
+                    if (rising) {
+                        if (!isRetriggering) {
+                            StepPress(buttonID);
+                        }
+                        break;
+                    }
+                    if (buttonID >= kNumKeyIds || !looper_owns_key_[buttonID]) {
+                        break; // this press never started a note
+                    }
+                }
+
+                // LOOPER: in Chroma the stepped pitch knob transposes everything the
+                // looper sounds, so the looper gets each key's own note and applies
+                // the transpose itself. The direct paths (arpeggiator) apply it here.
                 const int transpose = (fx_->getEngine() == CHROMATIC && looper_) ? looper_->Transpose() : 0;
-                float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60 + transpose) : 0.f;
+                const float raw_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60) : 0.f;
+                const float transpose_nn = raw_nn + static_cast<float>(transpose);
                 const uint8_t midi_note = static_cast<uint8_t>(key_map[buttonID] + transpose);
                 if (rising)
                 {
@@ -826,7 +883,7 @@ namespace chompi
 
                         // LOOPER: record the key press (and sound it, if it's the looper's)
                         if (looper_) {
-                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, midi_note,
+                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, raw_nn, key_map[buttonID],
                                                  via_looper);
                         }
                     }
@@ -863,6 +920,7 @@ namespace chompi
                     }
                 }
                 break;
+            }
             }
 
             return true;
@@ -936,7 +994,7 @@ namespace chompi
                     if (page == 0) {
                         if (quantized_pitch_) {
                             if (fx_->getEngine() == CHROMATIC && looper_) {
-                                // LOOPER: in Chroma the stepped knob transposes the keys
+                                // LOOPER: in Chroma the stepped knob transposes the keys and the loop
                                 if (stepsPerRevolution == 0) {
                                     looper_->StepTranspose(turns);
                                 }
@@ -1038,6 +1096,41 @@ namespace chompi
         inline void SetInitIgnore(bool ignore) { init_ignore = ignore; }
 
     private:
+        /** LOOPER: a key pressed in the step view: place the selected note(s) at that
+         *  step, or clear the step if it already has notes (NoteLooper decides). With
+         *  no selection, a random key's note is placed. */
+        void StepPress(uint16_t buttonID)
+        {
+            const int step = looper_->StepIndexOfKey(buttonID);
+            if (step < 0) {
+                return; // not a step key at this grid
+            }
+            const uint8_t eng = fx_->getEngine();
+            uint32_t sel = looper_->SelectedKeys();
+            if (sel == 0) {
+                sel = 1u << looper_ui::kKeyOrder[RandomKeyIndex()];
+            }
+            bool first = true;
+            for (int k = NoteLooper::kFirstKey; k <= NoteLooper::kLastKey; k++) {
+                if (!((sel >> k) & 1u)) {
+                    continue;
+                }
+                const float nn = eng == CHROMATIC ? static_cast<float>(key_map[k] - 60) : 0.f;
+                looper_->QueueStepEdit(eng, step, k, nn, key_map[k], first);
+                first = false;
+            }
+        }
+
+        /** LOOPER: 0-24, a different one each time (for random step notes) */
+        int RandomKeyIndex()
+        {
+            if (rng_ == 0) {
+                rng_ = System::GetUs() | 1u;
+            }
+            rng_ = rng_ * 1664525u + 1013904223u;
+            return static_cast<int>((rng_ >> 8) % 25u);
+        }
+
         Hardware *hw_;
         BaseEngine **engines_;
         ArpeggiatorSequencer *arpSeq_;
@@ -1058,6 +1151,7 @@ namespace chompi
         // LOOPER: keys whose current press the looper is sounding (it stops them too)
         static constexpr size_t kNumKeyIds = static_cast<size_t>(Hardware::SwId::SR_LAST);
         bool looper_owns_key_[kNumKeyIds] = {};
+        uint32_t rng_ = 0; // LOOPER: random step notes
         bool chompi_key_pressed = false;
         bool transport_held = false;
         uint8_t* knob_page;
