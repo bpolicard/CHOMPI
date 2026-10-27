@@ -86,8 +86,11 @@ namespace chompi
             boot_page_.Init(hw_, sManager_);
             ui.OpenPage(boot_page_);
 
+            // LOOPER: the shift menu's pitch knob is always stepped (there is no
+            // continuous pitch any more), so "Pitch Quantize In Shift Menu" is ignored
+            (void)pitch_shift_quant;
             menu_page_.Init(fx, clock_manager_, hw_, arpSeq_, enc_rows, def_rows, knob_page,
-                presets_manager, pitch_shift_quant, stateSaver, engines, options);
+                presets_manager, true, stateSaver, engines, options);
 
             test_page_.Init(hw_);
 
@@ -319,7 +322,7 @@ namespace chompi
                                     enc_defaults[0][1], enc_defaults[1][1],
                                     enc_defaults[0][2], enc_defaults[1][2],
                                     .5f, 0.f, 1.f, 1.f,
-                                    0.f}; // LOOPER: Chroma transpose
+                                    0.f}; // LOOPER: Chroma key transpose
 
             presets_manager->Init(defaults);
 

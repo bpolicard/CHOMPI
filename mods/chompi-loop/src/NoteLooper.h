@@ -7,9 +7,9 @@
  *  live quantize they can wait for the next grid line. They still reach the engines
  *  in the same audio block as before when they don't have to wait.
  *
- *  It also holds the Chroma transpose (the stepped pitch knob, in fourths and
- *  fifths). Notes are recorded untransposed; the transpose is applied when a note
- *  sounds, so the loop and the keys move together.
+ *  It also holds the Chroma key transpose (CHOMPI + the pitch knob, in fourths and
+ *  fifths) and maps every Chroma note to the key that plays that pitch at the current
+ *  transpose, so the key LEDs follow the pitches as you transpose.
  *
  *  And it runs the step view: Play + Loop held for a second switches the keys from
  *  playing notes to showing and editing the loop, one step of the quantize grid
@@ -115,9 +115,10 @@ class NoteLooper : public looper::Output
 
     // ------------- main loop side (UI pages) -------------
 
-    /** A key press. nn / note: the key's own pitch, untransposed (the transpose is
-     *  applied when the note sounds). sound: the looper sounds it (and stops it on
-     *  the release); otherwise it's only recorded (something else is sounding it). */
+    /** A key press. nn / note: the pitch to play, with the Chroma transpose already
+     *  applied (the note is recorded at that pitch). sound: the looper sounds it (and
+     *  stops it on the release); otherwise it's only recorded (something else is
+     *  sounding it). */
     void QueueNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool sound)
     {
         LooperInput in{LooperInput::Type::NOTE_ON,
@@ -137,8 +138,9 @@ class NoteLooper : public looper::Output
     }
 
     /** Step view: a step key was pressed. One call per note to place (a chord is
-     *  several calls with the same step, first = true on the first). If the step
-     *  already has notes of this engine, the press erases them instead. */
+     *  several calls with the same step, first = true on the first). nn / note as
+     *  for QueueNoteOn. If the step already has notes of this engine, the press
+     *  erases them instead. */
     void QueueStepEdit(uint8_t engine, int step, int key, float nn, uint8_t note, bool first)
     {
         LooperInput in{LooperInput::Type::STEP_EDIT,
@@ -195,14 +197,14 @@ class NoteLooper : public looper::Output
      *  started. Updated once per audio block. */
     int32_t BarPhaseUnits() const { return bar_phase_; }
 
-    // ------------- Chroma transpose (main loop) -------------
+    // ------------- Chroma key transpose (main loop) -------------
     //
-    // In Chroma the stepped pitch knob transposes everything the looper sounds: the
-    // keys you play and the notes in the loop. Steps alternate a fifth and a fourth,
-    // like TEMPO's stepped pitch, so two clicks make an octave: 0, +7, +12, +19, +24 ...
-    // and 0, -5, -12, -17, -24 ..., up to 4 octaves either way. Notes are stored
-    // untransposed and shifted when they sound, so a change takes effect from the
-    // next note that starts. MIDI-in notes are played as sent.
+    // In Chroma, CHOMPI + the pitch knob moves the keys instead of re-pitching the
+    // sample: a key plays (and sends over MIDI) its note plus the transpose. Steps
+    // alternate a fifth and a fourth, like TEMPO's stepped pitch, so two clicks make
+    // an octave: 0, +7, +12, +19, +24 ... and 0, -5, -12, -17, -24 ..., up to 4 octaves
+    // either way. Only notes you play (or place) from then on are affected; the loop
+    // keeps its pitches.
 
     static constexpr int kMaxTransposeSteps = 8;  // 4 octaves
     static constexpr int kMaxTranspose      = 48; // semitones
@@ -219,7 +221,7 @@ class NoteLooper : public looper::Output
         knob_turns_     = 0;
     }
 
-    /** Turn the stepped pitch knob in Chroma. */
+    /** Turn the pitch knob with CHOMPI held, in Chroma. */
     void StepTranspose(int turns)
     {
         knob_turns_ += turns;
@@ -523,20 +525,26 @@ class NoteLooper : public looper::Output
 
     void LoopNoteOn(const looper::Event &e) override
     {
-        NoteOut(e, KeyRequest::Source::SEQUENCER, sent_loop_);
+        const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
+                                                        static_cast<float>(e.nn),
+                                                        StartVoice(eng, e.key, e.note),
+                                                        127.f,
+                                                        KeyRequest::Source::SEQUENCER));
+        if(!(e.flags & looper::kFlagFromMidi))
+            hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOn);
     }
 
     void LoopNoteOff(uint8_t engine, int8_t key, uint8_t note, bool from_midi) override
     {
-        (void)note;
         const uint8_t eng = engine > 1 ? 1 : engine;
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP,
                                                         0.f,
-                                                        key,
+                                                        VoiceOf(eng, key, note),
                                                         127.f,
                                                         KeyRequest::Source::SEQUENCER));
         if(!from_midi)
-            hw_->queueMidiNote(midi_ch_[eng], sent_loop_[key & kSentMask], 127, NoteOff);
+            hw_->queueMidiNote(midi_ch_[eng], note, 127, NoteOff);
     }
 
     /** A note you played starts sounding. Sent as Source::USER, exactly like a key
@@ -544,7 +552,14 @@ class NoteLooper : public looper::Output
      *  loop (SEQUENCER) wants it, so a looped note ending can't cut a held key. */
     void LiveNoteOn(const looper::Event &e) override
     {
-        NoteOut(e, KeyRequest::Source::USER, sent_live_);
+        const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
+                                                        static_cast<float>(e.nn),
+                                                        StartVoice(eng, e.key, e.note),
+                                                        127.f,
+                                                        KeyRequest::Source::USER));
+        if(!(e.flags & looper::kFlagFromMidi))
+            hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOn);
     }
 
     void LiveNoteOff(const looper::Event &e) override
@@ -552,37 +567,16 @@ class NoteLooper : public looper::Output
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP,
                                                         static_cast<float>(e.nn),
-                                                        e.key,
+                                                        VoiceOf(eng, e.key, e.note),
                                                         127.f,
                                                         KeyRequest::Source::USER));
         if(!(e.flags & looper::kFlagFromMidi))
-            hw_->queueMidiNote(midi_ch_[eng], sent_live_[e.key & kSentMask], 127, NoteOff);
+            hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOff);
     }
 
   private:
-    static constexpr int kSentMask = 63; // voice ids (keys, and midi2key's extras) are < 64
-
-    /** Start a note on its engine and send it over MIDI, transposed if it's a Chroma
-     *  note from the keys or the step view. The MIDI note actually sent is remembered
-     *  per voice so the note-off matches even if the transpose moved meanwhile. */
-    void NoteOut(const looper::Event &e, KeyRequest::Source src, uint8_t *sent)
-    {
-        const uint8_t eng       = e.engine > 1 ? 1 : e.engine;
-        const bool    from_midi = e.flags & looper::kFlagFromMidi;
-        const int     t         = (eng == 0 && !from_midi) ? transpose_ : 0;
-        int           note      = static_cast<int>(e.note) + t;
-        note                    = note < 0 ? 0 : (note > 127 ? 127 : note);
-        engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
-                                                        static_cast<float>(e.nn + t),
-                                                        e.key,
-                                                        127.f,
-                                                        src));
-        if(!from_midi)
-        {
-            sent[e.key & kSentMask] = static_cast<uint8_t>(note);
-            hw_->queueMidiNote(midi_ch_[eng], static_cast<uint8_t>(note), 127, NoteOn);
-        }
-    }
+    static constexpr int kLowestKeyNote  = 48; // MIDI note of key 1 (C3) in Chroma
+    static constexpr int kHighestKeyNote = 72; // MIDI note of key 15 (C5)
 
     /** Transpose in semitones for a knob step: fifths and fourths, two steps an octave. */
     static int SemisForStep(int step)
@@ -598,6 +592,34 @@ class NoteLooper : public looper::Output
         const int m = semis < 0 ? -semis : semis;
         const int s = 2 * (m / 12) + ((m % 12) ? 1 : 0);
         return semis < 0 ? -s : s;
+    }
+
+    /** The engine voice for a note. Slice: the key, as always. Chroma: the key that
+     *  plays this pitch at the current transpose, so its LED lights; a pitch no key
+     *  reaches right now gets a voice id of its own (no LED). */
+    int VoiceForNote(uint8_t engine, int8_t key, uint8_t note) const
+    {
+        if(engine != 0)
+            return key;
+        const int n = static_cast<int>(note) - transpose_;
+        if(n >= kLowestKeyNote && n <= kHighestKeyNote)
+            return looper_ui::kKeyOrder[n - kLowestKeyNote];
+        return 200 + n + kMaxTranspose; // off the keyboard: unique, no LED (ids > 40)
+    }
+
+    /** Pick the voice for a note that starts now, and remember it for its note-off
+     *  (the transpose may change in between). */
+    int StartVoice(uint8_t engine, int8_t key, uint8_t note)
+    {
+        const int v = VoiceForNote(engine, key, note);
+        if(engine == 0)
+            chroma_voice_[note & 127] = static_cast<int16_t>(v);
+        return v;
+    }
+
+    int VoiceOf(uint8_t engine, int8_t key, uint8_t note) const
+    {
+        return engine == 0 ? chroma_voice_[note & 127] : key;
     }
 
     /** options.json grid value (notes per whole note, 0 = off) -> grid index */
@@ -752,12 +774,11 @@ class NoteLooper : public looper::Output
     volatile int32_t bar_phase_          = 0;
     uint32_t         clock_origin_units_ = 0; // timeline position the clock last started at
 
-    // Chroma transpose: set from the UI (main loop), read in the audio callback
+    // Chroma key transpose: set from the UI (main loop), read in the audio callback
     volatile int8_t transpose_      = 0; // semitones
     int             transpose_step_ = 0; // knob steps from 0
     int             knob_turns_     = 0; // detents toward the next step
-    uint8_t         sent_loop_[kSentMask + 1] = {}; // MIDI note sent for each voice (loop)
-    uint8_t         sent_live_[kSentMask + 1] = {}; // ... and for each voice played by hand
+    int16_t         chroma_voice_[128] = {}; // engine voice used for each Chroma note
 
     // CHOMPI key gesture
     bool     chompi_down_;

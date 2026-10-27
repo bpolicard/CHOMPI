@@ -139,8 +139,9 @@ namespace chompi
         return floor + (1.f - floor) * x * x;
     }
 
-    /** LOOPER: pitch-knob LED color while Chroma is transposed:
-     *  up = yellow toward red, down = blue toward purple, further = further along. */
+    /** LOOPER: pitch-knob LED color in the shift menu while the Chroma keys are
+     *  transposed: up = yellow toward red, down = blue toward purple, further =
+     *  further along. */
     static void TransposeLedColor(int semis, float &r, float &g, float &b)
     {
         const float t = static_cast<float>(semis < 0 ? -semis : semis) / NoteLooper::kMaxTranspose;
@@ -238,7 +239,9 @@ namespace chompi
             midi_channel[0] = options->midi_ch_out_chroma;
             midi_channel[1] = options->midi_ch_out_slice;
 
-            quantized_pitch_ = !options->pitch_shift_quantization;
+            // LOOPER: the pitch knob is always stepped (fifths and fourths); there is
+            // no continuous pitch any more, whatever "Pitch Quantize In Shift Menu" says
+            quantized_pitch_ = true;
             record_latch_ = options->record_latch;
 
             for (int knob = 0; knob < 6; knob++)
@@ -375,11 +378,6 @@ namespace chompi
                         r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], idx);
                         g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], idx);
                         b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], idx);
-                        // LOOPER: the stepped knob transposes Chroma; show it
-                        if (quantized_pitch_ && fx_->getEngine() == CHROMATIC && looper_
-                            && looper_->Transpose() != 0) {
-                            TransposeLedColor(looper_->Transpose(), r, g, b);
-                        }
                     }
                     else if(page == 1) // sample volume
                     {
@@ -834,12 +832,10 @@ namespace chompi
                     }
                 }
 
-                // LOOPER: in Chroma the stepped pitch knob transposes everything the
-                // looper sounds, so the looper gets each key's own note and applies
-                // the transpose itself. The direct paths (arpeggiator) apply it here.
+                // LOOPER: in Chroma, CHOMPI + the pitch knob transposes the keys (NoteLooper):
+                // a key plays, records and sends its note plus the transpose
                 const int transpose = (fx_->getEngine() == CHROMATIC && looper_) ? looper_->Transpose() : 0;
-                const float raw_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60) : 0.f;
-                const float transpose_nn = raw_nn + static_cast<float>(transpose);
+                const float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60 + transpose) : 0.f;
                 const uint8_t midi_note = static_cast<uint8_t>(key_map[buttonID] + transpose);
                 if (rising)
                 {
@@ -883,7 +879,7 @@ namespace chompi
 
                         // LOOPER: record the key press (and sound it, if it's the looper's)
                         if (looper_) {
-                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, raw_nn, key_map[buttonID],
+                            looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, midi_note,
                                                  via_looper);
                         }
                     }
@@ -992,19 +988,14 @@ namespace chompi
             switch (encoderID) {
                 case 0: {
                     if (page == 0) {
-                        if (quantized_pitch_) {
-                            if (fx_->getEngine() == CHROMATIC && looper_) {
-                                // LOOPER: in Chroma the stepped knob transposes the keys and the loop
-                                if (stepsPerRevolution == 0) {
-                                    looper_->StepTranspose(turns);
-                                }
-                            }
-                            else {
-                                enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
-                            }
+                        // LOOPER: the plain pitch knob steps the sample's pitch in fifths
+                        // and fourths (TEMPO's stepped pitch), in both engines. A MIDI CC
+                        // still sets the pitch continuously (external automation).
+                        if (stepsPerRevolution > 0 || !quantized_pitch_) {
+                            engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);
                         }
                         else {
-                            engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);
+                            enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
                         }
                     }
                     else if (page == 1) {
@@ -1098,7 +1089,8 @@ namespace chompi
     private:
         /** LOOPER: a key pressed in the step view: place the selected note(s) at that
          *  step, or clear the step if it already has notes (NoteLooper decides). With
-         *  no selection, a random key's note is placed. */
+         *  no selection, a random key's note is placed. Chroma notes take the current
+         *  transpose, as a key press would. */
         void StepPress(uint16_t buttonID)
         {
             const int step = looper_->StepIndexOfKey(buttonID);
@@ -1106,6 +1098,7 @@ namespace chompi
                 return; // not a step key at this grid
             }
             const uint8_t eng = fx_->getEngine();
+            const int transpose = eng == CHROMATIC ? looper_->Transpose() : 0;
             uint32_t sel = looper_->SelectedKeys();
             if (sel == 0) {
                 sel = 1u << looper_ui::kKeyOrder[RandomKeyIndex()];
@@ -1115,8 +1108,9 @@ namespace chompi
                 if (!((sel >> k) & 1u)) {
                     continue;
                 }
-                const float nn = eng == CHROMATIC ? static_cast<float>(key_map[k] - 60) : 0.f;
-                looper_->QueueStepEdit(eng, step, k, nn, key_map[k], first);
+                const float nn = eng == CHROMATIC ? static_cast<float>(key_map[k] - 60 + transpose) : 0.f;
+                const uint8_t note = static_cast<uint8_t>(key_map[k] + transpose);
+                looper_->QueueStepEdit(eng, step, k, nn, note, first);
                 first = false;
             }
         }
