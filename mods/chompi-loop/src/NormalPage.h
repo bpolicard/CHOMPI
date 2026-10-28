@@ -1,5 +1,5 @@
 #pragma once
- 
+
 #include "hardware.h"
 #include "SampleEngine.h"
 #include "SliceEngine.h"
@@ -10,14 +10,14 @@
 #include "NoteLooper.h"
 #include "FxEngine.h"
 #include "OptionsManager.h"
- 
+
 namespace chompi
 {
         static const uint8_t cc_map[3][6] = {
             {20, 21, 22, 23, 24, 25},
             {26, 27, 28, 29, 0, 30},
             {31, 0, 0, 0, 0, 0}};
- 
+
         static const uint8_t key_map[40] = {
             0x01, /**< ENC_1_SW  page */
             0x02, /**< ENC_2_SW page */
@@ -60,7 +60,7 @@ namespace chompi
             0x00, /**< NC_4 skip */
             0x00, /**< NC_5 skip */
         };
- 
+
         static const uint8_t led_map[40]{
             2,    /**< ENC_1_SW  page */
             3,    /**< ENC_2_SW page */
@@ -103,7 +103,7 @@ namespace chompi
             0x00, /**< NC_4 skip */
             0x00, /**< NC_5 skip */
         };
- 
+
     // .00787 ~= what midi was. 1 / 127
     static const float kEncoderFineStep = .003f;
     static const float kEncoderTempoStep = .003125f;
@@ -112,10 +112,10 @@ namespace chompi
     static const float kEncoderWtStep = 1.f / 6.f;
     static const float kEncoderCycleStep = 1.f / 33.f;
     static const float kRecDim = .7f;
- 
+
     uint8_t led_pth_cache[kNumPthLeds][3]; /**< RGB data */
     uint8_t led_smt_cache[kNumSmtLeds][3]; /**< RGB data */
- 
+
     static const float white[3] = {1.f, 1.f, 1.f};
     static const float red[3] = {1.f, 0.f, 0.f};
     static const float orange[3] = {1.f, .6f, .24f};
@@ -127,9 +127,9 @@ namespace chompi
     static const float blue[3] = {0.f, 0.f, 1.f};
     static const float purple[3] = {.58f, .05f, 1.f};
     static const float pink[3] = {1.f, .36f, .62f};
- 
+
     static const uint8_t knob_num_pages[6] = {3, 2, 2, 2, 1, 2};
- 
+
     /** LOOPER: LED brightness for a pulse that peaks on each line of a grid and fades
      *  until the next one. phase: units since the last line; period: units per line;
      *  floor: brightness between pulses. */
@@ -138,7 +138,7 @@ namespace chompi
         const float x = 1.f - static_cast<float>(phase) / static_cast<float>(period);
         return floor + (1.f - floor) * x * x;
     }
- 
+
     /** LOOPER: pitch-knob LED color while the Chroma keys are transposed:
      *  up = yellow toward red, down = blue toward purple, further = further along. */
     static void TransposeLedColor(int semis, float &r, float &g, float &b)
@@ -150,7 +150,7 @@ namespace chompi
         g = color_xfade(from[1], to[1], t);
         b = color_xfade(from[2], to[2], t);
     }
- 
+
     /** LOOPER: for a moment after the quantize grid changes, show it on white keys 1-9.
      *  Keys 1-8: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T (straight = teal,
      *  triplet = pink). Key 9: off (white). Bright = grid for new notes; medium = the
@@ -166,12 +166,12 @@ namespace chompi
             Hardware::SwId::KEY_1, Hardware::SwId::KEY_2, Hardware::SwId::KEY_3,
             Hardware::SwId::KEY_4, Hardware::SwId::KEY_5, Hardware::SwId::KEY_6,
             Hardware::SwId::KEY_7, Hardware::SwId::KEY_8, Hardware::SwId::KEY_9};
- 
+
         // all 25 keys off first
         for (size_t i = 7; i < 25 + 7; i++) {
             SetSmtLed(led_map[i], 0, 0, 0);
         }
- 
+
         const bool running = lp->IsRunning();
         const int32_t bar = lp->BarPhaseUnits();
         const int active = lp->ActiveGridIndex();
@@ -187,7 +187,7 @@ namespace chompi
         }
         return true;
     }
- 
+
     /** LOOPER: the step view. One key per step of the current grid, left to right:
      *  white = a note of the current engine starts here, red = the playhead,
      *  yellow = both. Everything is either full on or off. Keys past the page are
@@ -214,13 +214,13 @@ namespace chompi
         }
         return true;
     }
- 
+
     class NormalPage : public daisy::UiPage
     {
     public:
         uint32_t init_time;
         bool init_ignore = true;
- 
+
         void Init(fxEngine *fx, clockManager *clock_manager, ArpeggiatorSequencer *arpSeq, BaseEngine **engines, 
                     Hardware *hw, float** enc_arr, const float** def_arr, uint8_t* page, PresetManager* pre, 
                     OptionsManager *options)
@@ -234,16 +234,16 @@ namespace chompi
             enc_values = enc_arr;
             enc_defaults = def_arr;
             knob_page = page;
- 
+
             midi_channel[0] = options->midi_ch_out_chroma;
             midi_channel[1] = options->midi_ch_out_slice;
- 
+
             // LOOPER: the plain pitch knob is always stepped: in Chroma it transposes
             // the keys, in Slice it steps the sample's pitch. There is no continuous
             // pitch any more, whatever "Pitch Quantize In Shift Menu" says.
             quantized_pitch_ = true;
             record_latch_ = options->record_latch;
- 
+
             for (int knob = 0; knob < 6; knob++)
             {
                 for (int page = 0; page < 3; page++)
@@ -251,13 +251,13 @@ namespace chompi
                     enc_values[page][knob] = enc_defaults[page][knob];
                 }
             }
- 
- 
+
+
             for (int i = 0; i < kNumSmtLeds; i++)
                 SetSmtLed(i, 0, 0, 0);
             for (int i = 0; i < kNumPthLeds; i++)
                 SetPthLed(i, 0, 0, 0);
- 
+
             // 8mm leds
             SetPthLedFloat(0, 0.f, 0.f, 0.f);
             SetPthLedFloat(1, green[0], green[1], green[2]);
@@ -265,28 +265,28 @@ namespace chompi
             SetPthLedFloat(3, 0.f, 0.f, 0.f);
             SetPthLedFloat(4, 0.f, 0.f, 0.f);
             SetPthLedFloat(9, 0.f, 0.f, 0.f);
- 
+
             // 5mm leds
             SetPthLedFloat(5, 1.f, 1.f, 1.f);
             SetPthLedFloat(6, 1.f, 1.f, 1.f);
             SetPthLedFloat(7, 1.f, 1.f, 1.f);
             SetPthLedFloat(8, 1.f, 1.f, 1.f);
- 
+
             for (int i = 0; i < kNumSmtLeds; i++)
                 SetSmtLed(i, 0, 0, 0);
             // SetSmtLedFloat(i, .1f, .1f, .0f);
             // SetSmtLedFloat(0, 0.f, 0.f, 0.f);
             // SetSmtLedFloat(9, 0.f, 0.f, 0.f);
             // SetSmtLedFloat(10, 0.f, 0.f, 0.f);
- 
+
             init_time = System::GetNow();
         }
- 
+
         uint32_t last_arm_blink;
         bool arm_blink = true;
- 
+
         void SetLooper(NoteLooper *looper) { looper_ = looper; }
- 
+
         void ResetSmtLeds()
         {
             for(size_t i = 0; i < 25; i++)
@@ -294,23 +294,23 @@ namespace chompi
                 SetSmtLed(i, 0.f, 0.f, 0.f);
             }
         }
- 
+
         void CacheLeds()
         {
             std::copy(&led_pth_data[0][0], &led_pth_data[0][0] + kNumPthLeds * 3, &led_pth_cache[0][0]);
             std::copy(&led_smt_data[0][0], &led_smt_data[0][0] + kNumSmtLeds * 3, &led_smt_cache[0][0]);
         }
- 
+
         void RefreshLeds()
         {
             std::copy(&led_pth_cache[0][0], &led_pth_cache[0][0] + kNumPthLeds * 3, &led_pth_data[0][0]);
             std::copy(&led_smt_cache[0][0], &led_smt_cache[0][0] + kNumSmtLeds * 3, &led_smt_data[0][0]);
         }
- 
+
         void Draw(const daisy::UiCanvasDescriptor &canvasDescriptor) override
         {
             uint32_t now = System::GetNow();
- 
+
             // ignore the first 1500 ms of inputs. Hack to stop random button presses on boot for now.
             if (init_ignore)
             {
@@ -319,18 +319,18 @@ namespace chompi
                     init_ignore = false;
                 }
             }
- 
+
             if (now - freeze_hold > 750 && freeze_pressed) {
                 knob_page[3]++;
                 knob_page[3] %= knob_num_pages[3];
                 freeze_pressed = false;
             }
- 
+
             // LOOPER: the step view shows the engine that's selected
             if (looper_) {
                 looper_->SetViewEngine(fx_->getEngine());
             }
- 
+
             for(size_t i = 7; i < (25 + 7); i++)
             {
                 if (arpSeq_->isKeyPlaying(i) || (arpSeq_->isRestPlaying(i) && arpSeq_->getPlay(1) && fx_->getEngine() == SLICE)) {
@@ -355,16 +355,16 @@ namespace chompi
                     SetSmtLed(led_map[i], 0, 0, 0);
                 }
             }
- 
+
             // LOOPER: step view (replaces the key display while it's on)
             DrawLooperSteps(looper_);
- 
+
             // =========   encoders   =========
             for (int i = 0; i < 6; i++)
             {
                 uint8_t page = knob_page[i];
                 float value = enc_values[page][i];
- 
+
                 float r = 0.f; 
                 float g = 0.f;
                 float b = 0.f;
@@ -394,7 +394,7 @@ namespace chompi
                         g = color_xfade(purple[1], white[1], value);
                         b = color_xfade(purple[2], white[2], value);
                     }
- 
+
                     SetPthLedFloat(1, r, g, b);
                 }
                 break;
@@ -413,7 +413,7 @@ namespace chompi
                         b = color_xfade(purple[2] * .2f, purple[2], value);
                         
                     }
- 
+
                     SetPthLedFloat(2, r, g, b);
                     break;
                 }
@@ -431,7 +431,7 @@ namespace chompi
                         g = color_xfade(purple[1] * .2f, purple[1], value);
                         b = color_xfade(purple[2] * .2f, purple[2], value);
                     }
- 
+
                     SetPthLedFloat(3, r, g, b);
                     break;
                 }
@@ -451,9 +451,9 @@ namespace chompi
                         g = color_triple_xfade(yellow[1], orange[1], red[1], value);
                         b = color_triple_xfade(yellow[2], orange[2], red[2], value);
                     }
- 
+
                     SetPthLedFloat(4, r, g, b);
- 
+
                     break;
                 }
                 case 4: // transport
@@ -471,7 +471,7 @@ namespace chompi
                             r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], value);
                             g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], value);
                             b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], value);
- 
+
                             leds_[0] = leds_[3] = r;
                             leds_[1] = leds_[4] = g;
                             leds_[2] = leds_[5] = b;
@@ -493,10 +493,10 @@ namespace chompi
                                 leds_[3 + c] *= beat_lvl;
                             }
                         }
- 
+
                         SetPthLedFloat(5, leds_[0], leds_[1], leds_[2]);
                         SetPthLedFloat(6, leds_[3], leds_[4], leds_[5]);
- 
+
                         if (arpSeq_->getPlay(fx_->getEngine())) {
                             if (arpSeq_->getLeftLights()) {
                                 SetPthLedFloat(5, 0.f, 0.f, 0.f);
@@ -506,7 +506,7 @@ namespace chompi
                             }
                         }
                     }
- 
+
                     break;
                 }
                 case 5: // gain
@@ -514,7 +514,7 @@ namespace chompi
                     if(batt_display && System::GetNow() - batt_hold > 2000)
                     {
                         const float* color = &green[0];
- 
+
                         switch(hw_->GetBatteryLevel())
                         {
                             case Hardware::BatteryLevel::FULL:
@@ -532,7 +532,7 @@ namespace chompi
                             default:
                             break;
                         }
- 
+
                         r = color[0];
                         g = color[1];
                         b = color[2];
@@ -557,13 +557,13 @@ namespace chompi
                     break;
                 }
             }
- 
+
             /** PTH leds */
             float r, g, b;
             // play key
- 
+
             r = g = b = 0.f;
- 
+
             // LOOPER: teal while the loop / clock is running; white in the step view
             // (dim white when stopped in the step view)
             if (looper_ && looper_->InStepView()) {
@@ -577,11 +577,11 @@ namespace chompi
             else {
                 r = g = b = 0.f;
             }
- 
+
             SetPthLedFloat(led_map[33], r, g, b);
- 
+
             // loop key
- 
+
             // LOOPER state:
             //   armed: blinking red   recording: red   overdub: pink
             //   playing: green (dim while stopped)   memory full: blinking yellow
@@ -612,11 +612,11 @@ namespace chompi
                     b = c[2] * level;
                 }
             }
- 
+
             SetPthLedFloat(led_map[34], r, g, b);
- 
+
             // chompi key
- 
+
             fx_->SetInputMonitor(!switch_state);
             if (!switch_state) {
                 if (fx_->getRecording()) {
@@ -626,12 +626,12 @@ namespace chompi
                 }
                 else {
                     float vu_sample = fx_->getVUSampleInput();
- 
+
                     r = color_quad_xfade(.1f, green[0], yellow[0], pink[0], vu_sample);
                     g = color_quad_xfade(.1f, green[1], yellow[1], pink[1], vu_sample);
                     b = color_quad_xfade(.1f, green[2], yellow[2], pink[2], vu_sample);
                 }
- 
+
             }
             else {
                 if (chompi_key_pressed) {
@@ -643,23 +643,23 @@ namespace chompi
                     r = g = b = 0.f;
                 }
             }
- 
+
             SetPthLedFloat(led_map[5], r, g, b);
- 
+
             // LOOPER: quantize grid display (overrides the keys for a moment)
             DrawLooperGrid(looper_);
- 
+
             // ========   send the data   =========
             fill_led_data();
         }
- 
+
         bool OnButton(uint16_t buttonID,
                       uint8_t numberOfPresses,
                       bool isRetriggering) override
         {
             if (init_ignore)
                 return false;
- 
+
             bool rising = numberOfPresses == 1;
             switch (buttonID)
             {
@@ -671,7 +671,7 @@ namespace chompi
             case static_cast<uint16_t>(Hardware::SwId::NC_5): // fall through
                                                               // case static_cast<uint16_t>(Hardware::SwId::NC_6): // caught in ui.h
                 break;
- 
+
             // encoder clicks, toggle pages
             case static_cast<uint16_t>(Hardware::SwId::ENC_1_SW): // fall through
             case static_cast<uint16_t>(Hardware::SwId::ENC_2_SW): // fall through
@@ -700,7 +700,7 @@ namespace chompi
                 }
                 break;
             }
- 
+
             case static_cast<uint16_t>(Hardware::SwId::ENC_6_SW):
             {
                 if(!rising && System::GetNow() - batt_hold < 2000)
@@ -709,13 +709,13 @@ namespace chompi
                     knob_page[knob]++;
                     knob_page[knob] %= knob_num_pages[knob];
                 }
- 
+
                 batt_hold = System::GetNow();
                 batt_display = rising;
- 
+
                 break;
             }
- 
+
             // reset the looper pitch
             case ENC_5_SW:
             {
@@ -728,22 +728,22 @@ namespace chompi
                     enc_values[0][4] = clock_manager_->processTapClock(enc_values[0][4]);
                     transport_held = true;
                 }
- 
+
                 break;
             }
- 
+
             // toggle. We're not using this anymore, just here in case something breaks
             case static_cast<uint16_t>(Hardware::SwId::SW_TOG): // fall through
                 // switch_state = rising;
                 // if (!rising)
                 //     midi_channel = 0;
- 
+
                 // some weirdness results in handling this on edges rather than as pressed
                 // for example if you hold the chompi key with the switch up then toggle the sw
                 // down, you'll be on ch 1 until you release and repress the chompi key
                 // then it will go to ch 2 like it should
                 break;
- 
+
             // CC buttons
             // case static_cast<uint16_t>(Hardware::SwId::ENC_4_SW):
             // {
@@ -751,15 +751,15 @@ namespace chompi
             //     {
             //         enc_values[0][0] = enc_defaults[0][0];
             //         hw_->SendCC(midi_channel, cc_map[0][0], enc_values[0][0] * 127);
- 
+
             //         DumpValuePresets();
             //         SetPthLedFloat(1, green[0], green[1], green[2]);
             //     }
- 
+
             //     hw_->SendCC(midi_channel, key_map[buttonID], rising ? 127 : 0);
             //     break;
             // }
- 
+
             // CC buttons
             case static_cast<uint16_t>(Hardware::SwId::KEY_27): // play
             {
@@ -767,7 +767,7 @@ namespace chompi
                 // and Play + Loop held for a second toggles the step view. Both are
                 // handled by NoteLooper (fed from ui.h), so nothing happens here.
                 last_arm_blink = System::GetNow();
- 
+
                 break;
             }
             case static_cast<uint16_t>(Hardware::SwId::KEY_28): // loop
@@ -775,11 +775,11 @@ namespace chompi
                 // LOOPER: the arp latch is gone. Loop key gestures are handled by
                 // NoteLooper (fed from ui.h), so nothing else happens here.
                 last_arm_blink = System::GetNow();
- 
+
                 hw_->queueMidiCC(midi_channel[fx_->getEngine()], 15, rising ? 127 : 0);
                 break;
             }
- 
+
             case static_cast<uint16_t>(Hardware::SwId::KEY_26):
             {
                 chompi_key_pressed = rising;
@@ -795,13 +795,13 @@ namespace chompi
                         if (fx_->getEngine() == CHROMATIC && engines_[SLICE]->getVoiceSlot() == 15) {
                             engines_[SLICE]->setSample(14);
                         }
- 
+
                         enc_values[0][0] = enc_defaults[0][0];
                         enc_values[1][0] = enc_defaults[1][0];
                         enc_values[0][1] = enc_defaults[0][1];
                         enc_values[0][2] = enc_defaults[0][2];
                         enc_values[2][0] = enc_defaults[2][0];
- 
+
                         for (size_t i = 0; i < kNumEngines; ++i) {
                             engines_[fx_->getEngine()]->resetGlobalPitchQuant();
                             engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);
@@ -811,13 +811,13 @@ namespace chompi
                             engines_[fx_->getEngine()]->setMasterCutoff(enc_values[2][0]);
                         }
                         record_reset = true;
- 
+
                     }
                 }
  
                 break;
             }
- 
+
             // keys
             default:
             {
@@ -835,7 +835,7 @@ namespace chompi
                         break; // this press never started a note
                     }
                 }
- 
+
                 // LOOPER: in Chroma the pitch knob transposes the keys (NoteLooper):
                 // a key plays, records and sends its note plus the transpose
                 const int transpose = (fx_->getEngine() == CHROMATIC && looper_) ? looper_->Transpose() : 0;
@@ -857,7 +857,7 @@ namespace chompi
                         if (buttonID < kNumKeyIds) {
                             looper_owns_key_[buttonID] = via_looper;
                         }
- 
+
                         if (arpSeq_->getPlay(fx_->getEngine())) {
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
@@ -867,10 +867,10 @@ namespace chompi
                                 engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                     transpose_nn, buttonID, 127.f));
                             }
- 
+
                             arpSeq_->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
                                 static_cast<float>(key_map[buttonID] - 60), buttonID, 127.f));
- 
+
                         }
                         else if (!via_looper) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START, 
@@ -880,7 +880,7 @@ namespace chompi
                         if (!arpSeq_->getPlay(fx_->getEngine()) && !via_looper) {
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], midi_note, 127, NoteOn);
                         }
- 
+
                         // LOOPER: record the key press (and sound it, if it's the looper's)
                         if (looper_) {
                             looper_->QueueNoteOn(fx_->getEngine(), buttonID, transpose_nn, midi_note,
@@ -898,7 +898,7 @@ namespace chompi
                             via_looper = looper_owns_key_[buttonID];
                             looper_owns_key_[buttonID] = false;
                         }
- 
+
                         //regular key mode. Stop transpose_nn_ is 0 because you don't need it? Seems a bit weird
                         if (!via_looper && !arpSeq_->getSustain() && !arpSeq_->checkNotePlaying(key_map[buttonID] - 60)) {
                             engines_[fx_->getEngine()]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::STOP, 
@@ -911,7 +911,7 @@ namespace chompi
                         if (!via_looper && !arpSeq_->getPlay(fx_->getEngine()) && !arpSeq_->getSustain()) {
                             hw_->queueMidiNote(midi_channel[fx_->getEngine()], midi_note, 127, NoteOff);
                         }
- 
+
                         // LOOPER: record the key release (sets the note's length, and
                         // stops the note if the looper is sounding it)
                         if (looper_) {
@@ -922,19 +922,19 @@ namespace chompi
                 break;
             }
             }
- 
+
             return true;
         }
- 
+
         bool OnEncoderTurned(uint16_t encoderID,
                              int16_t turns,
                              uint16_t stepsPerRevolution) override
         {
             if (init_ignore)
                 return false;
- 
+
             uint8_t page = knob_page[encoderID];
- 
+
             // overrode this to mean increment vs force knob position (used for CCs)
             if(stepsPerRevolution > 0)
             {
@@ -948,7 +948,7 @@ namespace chompi
             }
             else{
                 float inc = turns * kEncoderCoarseStep;
- 
+
                 // fine steps for pitch, sample start, and sample end
                 if ((encoderID == 0 && page == 0 && !quantized_pitch_) || (encoderID == 3 && page == 0))
                 {
@@ -982,13 +982,13 @@ namespace chompi
                 else if (encoderID == 0 && page == 0 && quantized_pitch_) {
                     inc = 0.f;
                 }
- 
+
                 enc_values[page][encoderID] += inc;
             }
- 
+
             // clip
             enc_values[page][encoderID] = fclamp(enc_values[page][encoderID], 0.f, 1.f);
- 
+
             switch (encoderID) {
                 case 0: {
                     if (page == 0) {
@@ -1067,33 +1067,33 @@ namespace chompi
                 }
                 break;
             }
- 
+
             if (stepsPerRevolution == 0) {
                 hw_->queueMidiCC(midi_channel[fx_->getEngine()], cc_map[page][encoderID], enc_values[page][encoderID] * 127);
             }
- 
+
             return true;
         }
- 
+
         bool getRecordReset() {
             return record_reset;
         }
- 
+
         void resetRecordReset() {
             record_reset = false;
         }
- 
+
         void SetSwitchState(bool state)
         {
             switch_state = state; 
         }
- 
+
         bool getSwitchState() {
             return switch_state;
         }
- 
+
         inline void SetInitIgnore(bool ignore) { init_ignore = ignore; }
- 
+
     private:
         /** LOOPER: a key pressed in the step view: place the selected note(s) at that
          *  step, or clear the step if it already has notes (NoteLooper decides). With
@@ -1122,7 +1122,7 @@ namespace chompi
                 first = false;
             }
         }
- 
+
         /** LOOPER: 0-24, a different one each time (for random step notes) */
         int RandomKeyIndex()
         {
@@ -1132,18 +1132,18 @@ namespace chompi
             rng_ = rng_ * 1664525u + 1013904223u;
             return static_cast<int>((rng_ >> 8) % 25u);
         }
- 
+
         Hardware *hw_;
         BaseEngine **engines_;
         ArpeggiatorSequencer *arpSeq_;
         fxEngine *fx_;
- 
+
         clockManager *clock_manager_;
         PresetManager* presets_;
- 
+
         float** enc_values;
         const float** enc_defaults;
- 
+
         /** todo: these really shouldn't be stored in here
          *  Gonna move them out to a midi engine later
         */ 
@@ -1159,11 +1159,11 @@ namespace chompi
         uint8_t* knob_page;
         bool quantized_pitch_;
         bool record_latch_;
- 
+
         bool record_reset = false;
- 
+
         bool batt_display, freeze_pressed;
         uint32_t batt_hold, freeze_hold;
     };
- 
+
 } // namespace chompi
