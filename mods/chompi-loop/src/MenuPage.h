@@ -40,8 +40,9 @@ namespace chompi
             
             midi_channel[0] = options->midi_ch_out_chroma;
             midi_channel[1] = options->midi_ch_out_slice;
-            // LOOPER: CHOMPI + Pitch steps the sample's pitch in Chroma and sweeps it
-            // continuously in Slice, whatever "Pitch Quantize In Shift Menu" says
+            // LOOPER: CHOMPI + Pitch is fixed per engine (Chroma stepped, Slice
+            // continuous), whatever "Pitch Quantize In Shift Menu" says. Kept for the
+            // fine / coarse step logic only.
             quantized_pitch_ = ps_quant;
 
             input_toggled_ = false;
@@ -329,7 +330,7 @@ namespace chompi
 
                 SetPthLedFloat(9, r, g, b);
 
-                // pitch knob: the sample's pitch
+                // pitch knob: the sample's pitch (stepped in Chroma, continuous in Slice)
                 if(pitch_reset)
                 {
                     r = g = b = 1.f;
@@ -529,8 +530,7 @@ namespace chompi
             uint8_t page = knob_page[encoderID];
             float inc = turns * kEncoderCoarseStep;
 
-            // LOOPER: CHOMPI + Pitch in Slice is the continuous pitch: fine steps
-            if (encoderID == 0 && page == 0 && fx_->getEngine() != CHROMATIC) {
+            if (encoderID == 0 && page == 0 && !quantized_pitch_) {
                 inc = turns * kEncoderFineStep;
             }
 
@@ -544,16 +544,16 @@ namespace chompi
                 switch (encoderID) {
                     case 0:
                     {
-                        if(page == 0) // pitch
+                        if(page == 0) // sample pitch
                         {
-                            // LOOPER: CHOMPI + Pitch. Chroma: steps the sample's pitch in
-                            // fifths and fourths (the key transpose is on the plain knob).
-                            // Slice: sweeps the sample's pitch continuously, as in TEMPO.
+                            // LOOPER: CHOMPI + Pitch re-pitches the sample. Chroma: stepped,
+                            // in fifths and fourths (the key transpose is on the plain knob).
+                            // Slice: continuous, as in TEMPO.
                             if (fx_->getEngine() == CHROMATIC) {
                                 enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
                             }
                             else {
-                                enc_values[0][0] += inc;
+                                enc_values[0][0] += turns * kEncoderFineStep;
                                 enc_values[0][0] = fclamp(enc_values[0][0], 0.f, 1.f);
                                 engines_[fx_->getEngine()]->setGlobalPitchFree(enc_values[0][0]);
                             }
