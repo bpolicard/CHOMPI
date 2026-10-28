@@ -45,7 +45,8 @@ Mode switch **down** (the CHOMPI key is shift):
 | Play + Loop, hold 1 s | Switch between the key view and the **step view** (see below). Either order. Keys held when the second is up pick the note(s) the step view places. |
 | Press + turn Tempo knob | Scroll the quantize grid through every value: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T, off. (Replaces TEMPO's clock division.) |
 | CHOMPI + turn Tempo knob | Hop to the nearest straight / triplet grid just above or below the one you scrolled to (e.g. from 1/8T: up to 1/16, down to 1/8), and back. (Replaces TEMPO's arp randomness.) |
-| Stepped pitch knob, in Chroma | Transposes everything Chroma plays — the keys and the loop — in fifths and fourths (see below). In Slice it steps the pitch as in TEMPO. |
+| Pitch knob | Chroma: transposes the keys in fifths and fourths (see below); the loop keeps its pitch. Slice: steps the sample's pitch in fifths and fourths. Pressing the knob still switches its pages. |
+| CHOMPI + Pitch knob | Chroma: steps the sample's pitch in fifths and fourths (TEMPO's stepped pitch), so the loop and keys re-pitch together. Slice: the continuous pitch, as in TEMPO. |
 
 A "tap" is a press shorter than 0.4 s with no other key or knob touched; anything else
 is a normal shift function. Play held together with Loop never toggles the transport.
@@ -78,21 +79,26 @@ and when the grid is off.
 **Play LED:** teal while the transport runs; white in the step view (dim white when
 stopped in the step view).
 
-**Chroma transpose:** in Chroma, the *stepped* pitch knob (CHOMPI + Pitch by default;
-the plain Pitch knob if `Pitch Quantize In Shift Menu` is `false`) transposes everything
-the looper plays — the keys you press and the notes in the loop — instead of re-pitching
-the sample. The steps are TEMPO's: a fifth, then a fourth (0, +7, +12, +19, +24 …;
-0, −5, −12, −17, −24 …), four detents per step, up to four octaves either way. Notes are
-stored untransposed and shifted as they sound, so the loop moves with the knob and a
-looped note still lights the key you played it on. MIDI out follows: a transposed key
-sends its note plus the transpose, and so does the loop. A change takes effect from the
-next note that starts; a note already sounding keeps its pitch (stock TEMPO re-pitches
-sounding notes at once — that's the one difference). The pitch knob's LED shows the
-transpose: yellow toward red going up, blue toward purple going down; pressing the knob
-in the shift menu resets it to 0 along with the pitch. The continuous pitch knob still
-re-pitches the sample (including reverse), MIDI-in notes are played as sent, and Slice is
-unchanged. The transpose is saved with presets (as a 12th value in `presets.json`, which
-stock TEMPO ignores) and with the A / B states.
+**Pitch knobs:** the pitch knob and CHOMPI + Pitch no longer depend on
+`Pitch Quantize In Shift Menu` (the option is still read and written, but ignored).
+In Chroma the plain knob is the key transpose (below) and CHOMPI + Pitch is the sample's
+stepped pitch in fifths and fourths, which re-pitches everything Chroma plays, loop
+included. In Slice the plain knob is the sample's stepped pitch and CHOMPI + Pitch is the
+continuous pitch, as in TEMPO. A MIDI CC on the pitch knob sets the sample's pitch
+continuously in either engine.
+
+**Chroma key transpose:** in Chroma, the plain pitch knob moves the *keys* instead of
+re-pitching the sample. Each key plays, records and sends over MIDI its own note plus
+the transpose, so a transposed key sounds right *and* lands on the right MIDI note. The
+steps are fifths and fourths (0, +7, +12, +19, +24 …; 0, −5, −12, −17, −24 …), four
+detents per step, up to four octaves either way. The pitch knob's LED shows it: yellow
+toward red going up, blue toward purple going down; pressing the knob in the shift menu
+resets it to 0 along with the sample's pitch. Only notes you play (or place in the step
+view) from then on are affected; notes already in the loop keep their pitch. The key LEDs
+follow the pitches: a looped note lights the key that would play that pitch *now*, so as
+you transpose down the pattern walks up the keyboard and off the top, and the other way
+round. MIDI-in notes are played as sent. The transpose is saved with presets (as a 12th
+value in `presets.json`, which stock TEMPO ignores) and with the A / B states.
 
 ### Step view
 
@@ -119,7 +125,8 @@ showing and editing the loop; the same hold switches back. The Play LED turns wh
   playing when you started the hold keeps sounding (and is recorded if you're
   overdubbing) until you let go. With no key held, every press places a random key's
   note (Chroma: a random pitch across the 25 keys; Slice: a random slice). Re-enter the
-  step view to change the selection.
+  step view to change the selection. In Chroma a placed note takes the key transpose at
+  the moment you place it, like a key press.
 - **No loop yet.** The step view shows one empty bar (with the playhead running through
   it if the transport is on). The first note you place creates a 1-bar loop and starts
   it: aligned to the last bar line if the transport was running, or starting that moment
@@ -150,6 +157,8 @@ CCs, but no notes (`MIDI CC Out` still controls the CCs).
 | `Loop Live Quantize` | `true`: while the loop runs, notes you play wait for the next grid line before they sound, and are recorded there. `false`: notes sound the moment you play them; your timing is recorded and pulled to the nearest grid line on playback | `true` |
 | `MIDI Note Out` | `false`: no note on / off messages on MIDI out (clock, Start / Stop and CCs are unaffected) | `true` |
 
+TEMPO's `Pitch Quantize In Shift Menu` is still read and written but has no effect.
+
 Note *lengths* are always kept exactly as you held them. With live quantize, a note's
 length counts from when it actually sounds, so if you let go before its grid line it
 still plays, for as long as you held the key. With quantize strength below 100 %, a
@@ -168,11 +177,13 @@ Please send back:
 2. Results of these:
    - Play: a tap still starts / stops the transport (now when you let go). Holding Play
      on its own does nothing until you release it.
-   - Transpose (Chroma): record a short loop, then CHOMPI + turn the pitch knob. The loop
-     and new keys should move together, by fifths and fourths; a note already sounding
-     finishes at its old pitch. The lit keys stay where you played them. Save a preset,
-     change the transpose, recall the preset: it should come back. Press the pitch knob
-     in the shift menu: back to 0. Check MIDI out follows the transpose, for keys and loop.
+   - Pitch knob in Chroma: record a short loop, then turn it. The loop should keep its
+     pitch while new keys play transposed, and the lit keys should shift along the
+     keyboard (off the end after two octaves or so). Save a preset, change the transpose,
+     recall the preset: it should come back. Press the knob in the shift menu: back to 0.
+   - CHOMPI + Pitch in Chroma: steps by a fifth then a fourth with every four detents, and
+     the loop re-pitches with it. In Slice, CHOMPI + Pitch is still the smooth pitch and
+     the plain knob steps.
    - Step view, with a 1/16 loop playing: hold Play + Loop for a second. 16 keys; white
      where your notes start, red running across at 16th-note speed. Change the grid
      (press + turn Tempo): 1/4 shows 6 bars on 24 keys (lumped), 1/32 shows half a bar at
@@ -181,7 +192,8 @@ Please send back:
      those steps, one 16th long, and plays when the loop reaches them. Press a lit key:
      its notes go silent. CHOMPI + Loop tap: the last press is undone (erased notes come
      back). Enter the step view with two keys held: each press places both. Enter it with
-     nothing held: each press places a random note.
+     nothing held: each press places a random note. In Chroma with a transpose set, the
+     placed notes are transposed.
    - Step view with no loop (clear first): hold Play + Loop, press a key. A 1-bar loop
      starts playing with that note in it. Try it with the transport running and stopped.
    - Switch engines while in the step view: the display follows. Slice notes placed from
@@ -198,8 +210,6 @@ Please send back:
 
 - MIDI sync through did not work in hardware testing (clocked from one device, the next
   device on CHOMPI's MIDI out didn't follow). Parked; possibly a hardware limitation.
-- Transposing while a note sounds doesn't re-pitch it; the new transpose applies from
-  the next note that starts.
 - Step edits made while overdubbing share an undo layer with the notes you overdub
   after them, until the next edit.
 - The step view's placed notes are one step long at the tempo when you placed them
@@ -217,6 +227,8 @@ Please send back:
 - Transpose is a single setting for Chroma (not per A / B state while you're in Slice —
   switching A / B in Slice applies Chroma's saved transpose for that state too, as TEMPO
   does for Chroma's other settings).
+- Rare: if the transpose changes while the *same pitch* overlaps from two sources (e.g.
+  a looped note and a held key), one voice can be released early or late.
 - `Loop Live Quantize` and `MIDI Note Out` are set in `options.json` only (no gesture).
 
 ## Roadmap (agreed design)
@@ -260,18 +272,21 @@ Please send back:
 - `NoteLooper.h`: connects LoopCore to the engines, MIDI, clock, options, and the
   CHOMPI / Loop / Play key gestures (fed from `ui.h`). Looped notes go to the engines as
   `Source::SEQUENCER`, live notes as `Source::USER` (like a key press), so the engines
-  keep a voice going while either wants it. Applies the Chroma transpose as notes
-  sound (`NoteOut`), remembering the MIDI note sent per voice for the note-off. Runs the
-  step view: the Play + Loop hold, the page / mask / playhead the UI draws
-  (`UpdateStepView`, every 8th block), and the edits (`StepEdit`).
+  keep a voice going while either wants it. Holds the Chroma transpose and picks each
+  Chroma note's engine voice from its pitch (the key that plays it at the current
+  transpose), which is what moves the key LEDs. Runs the step view: the Play + Loop
+  hold, the page / mask / playhead the UI draws (`UpdateStepView`, every 8th block),
+  and the edits (`StepEdit`).
 - `NormalPage.h`: plain notes (no arpeggiator) are handed to the looper to sound
-  instead of being sent to the engines directly, untransposed; the arpeggiator paths
-  are unchanged and only record into the looper. Draws the step view
-  (`DrawLooperSteps`) and turns step-view key presses into edits (`StepPress`).
+  instead of being sent to the engines directly, with the transpose applied; the
+  arpeggiator paths are unchanged and only record into the looper. The plain pitch knob
+  is the key transpose in Chroma and the stepped sample pitch in Slice. Draws the step
+  view (`DrawLooperSteps`) and turns step-view key presses into edits (`StepPress`).
+- `MenuPage.h`: CHOMPI + Pitch is the stepped sample pitch in Chroma and the continuous
+  one in Slice; the knob press resets the sample pitch and the transpose; the transpose
+  is saved with presets (value 11) and A / B states (`StateSaver.h`, `PresetManager.h`).
 - `ui.h`: feeds the Play key to the looper and lets it swallow key presses while
   Play + Loop are held (`OnKeyEdge`).
-- `MenuPage.h`, `StateSaver.h`, `PresetManager.h`: the transpose on the stepped knob,
-  its LED, knob-press reset, and saving (A / B state field; preset value 11).
 - `OptionsManager.h`: the three looper options and `MIDI Note Out`, plus a guard so an
   options.json with fewer entries (like stock TEMPO's) can't crash the parser.
 - `MidiManager.h`: besides routing notes to the looper, passes clock / Start / Stop

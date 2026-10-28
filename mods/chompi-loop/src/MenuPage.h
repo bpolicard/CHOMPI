@@ -40,6 +40,8 @@ namespace chompi
             
             midi_channel[0] = options->midi_ch_out_chroma;
             midi_channel[1] = options->midi_ch_out_slice;
+            // LOOPER: CHOMPI + Pitch steps the sample's pitch in Chroma and sweeps it
+            // continuously in Slice, whatever "Pitch Quantize In Shift Menu" says
             quantized_pitch_ = ps_quant;
 
             input_toggled_ = false;
@@ -327,7 +329,7 @@ namespace chompi
 
                 SetPthLedFloat(9, r, g, b);
 
-                // pitch knob
+                // pitch knob: the sample's pitch
                 if(pitch_reset)
                 {
                     r = g = b = 1.f;
@@ -338,11 +340,6 @@ namespace chompi
                     r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], idx);
                     g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], idx);
                     b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], idx);
-                    // LOOPER: the stepped knob transposes the Chroma keys; show it
-                    if (quantized_pitch_ && fx_->getEngine() == CHROMATIC && looper_
-                        && looper_->Transpose() != 0) {
-                        TransposeLedColor(looper_->Transpose(), r, g, b);
-                    }
                 }
                 else if(knob_page[0] == 1)
                 {
@@ -532,7 +529,8 @@ namespace chompi
             uint8_t page = knob_page[encoderID];
             float inc = turns * kEncoderCoarseStep;
 
-            if (encoderID == 0 && page == 0 && !quantized_pitch_) {
+            // LOOPER: CHOMPI + Pitch in Slice is the continuous pitch: fine steps
+            if (encoderID == 0 && page == 0 && fx_->getEngine() != CHROMATIC) {
                 inc = turns * kEncoderFineStep;
             }
 
@@ -546,16 +544,13 @@ namespace chompi
                 switch (encoderID) {
                     case 0:
                     {
-                        if(page == 0) // stepped pitch
+                        if(page == 0) // pitch
                         {
-                            if (quantized_pitch_) {
-                                if (fx_->getEngine() == CHROMATIC && looper_) {
-                                    // LOOPER: in Chroma the stepped knob transposes the keys
-                                    looper_->StepTranspose(turns);
-                                }
-                                else {
-                                    enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
-                                }
+                            // LOOPER: CHOMPI + Pitch. Chroma: steps the sample's pitch in
+                            // fifths and fourths (the key transpose is on the plain knob).
+                            // Slice: sweeps the sample's pitch continuously, as in TEMPO.
+                            if (fx_->getEngine() == CHROMATIC) {
+                                enc_values[0][0] = engines_[fx_->getEngine()]->setGlobalPitchQuantized(turns, enc_values[0][0]);
                             }
                             else {
                                 enc_values[0][0] += inc;
