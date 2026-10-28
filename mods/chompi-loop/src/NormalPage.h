@@ -287,6 +287,11 @@ namespace chompi
 
         void SetLooper(NoteLooper *looper) { looper_ = looper; }
 
+        /** LOOPER: build signature. For 3 s after the boot rainbow, white keys 1-4 light
+         *  blue, so you can tell at a glance that this build (update-4) is the one on
+         *  the card. An older build shows nothing here. */
+        void ShowBuildSignature() { signature_until_ = System::GetNow() + 3000; }
+
         void ResetSmtLeds()
         {
             for(size_t i = 0; i < 25; i++)
@@ -648,6 +653,15 @@ namespace chompi
 
             // LOOPER: quantize grid display (overrides the keys for a moment)
             DrawLooperGrid(looper_);
+
+            // LOOPER: build signature (see ShowBuildSignature): white keys 1-4 blue
+            if (signature_until_ != 0 && now < signature_until_) {
+                static const Hardware::SwId sig_keys[4] = {
+                    Hardware::SwId::KEY_1, Hardware::SwId::KEY_2, Hardware::SwId::KEY_3, Hardware::SwId::KEY_4};
+                for (int k = 0; k < 4; k++) {
+                    SetSmtLedFloat(led_map[static_cast<int>(sig_keys[k])], blue[0], blue[1], blue[2]);
+                }
+            }
 
             // ========   send the data   =========
             fill_led_data();
@@ -1153,7 +1167,8 @@ namespace chompi
         // LOOPER: keys whose current press the looper is sounding (it stops them too)
         static constexpr size_t kNumKeyIds = static_cast<size_t>(Hardware::SwId::SR_LAST);
         bool looper_owns_key_[kNumKeyIds] = {};
-        uint32_t rng_ = 0; // LOOPER: random step notes
+        uint32_t rng_ = 0;              // LOOPER: random step notes
+        uint32_t signature_until_ = 0;  // LOOPER: build signature shown until this time
         bool chompi_key_pressed = false;
         bool transport_held = false;
         uint8_t* knob_page;

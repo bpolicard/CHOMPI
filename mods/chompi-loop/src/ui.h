@@ -86,8 +86,8 @@ namespace chompi
             boot_page_.Init(hw_, sManager_);
             ui.OpenPage(boot_page_);
 
-            // LOOPER: the shift menu's pitch knob is always stepped (there is no
-            // continuous pitch any more), so "Pitch Quantize In Shift Menu" is ignored
+            // LOOPER: what the shift menu's pitch knob does is fixed per engine (see
+            // MenuPage), so "Pitch Quantize In Shift Menu" is ignored
             (void)pitch_shift_quant;
             menu_page_.Init(fx, clock_manager_, hw_, arpSeq_, enc_rows, def_rows, knob_page,
                 presets_manager, true, stateSaver, engines, options);
@@ -200,6 +200,7 @@ namespace chompi
             {
                 ui.ClosePage(rainbow_page_);
                 normal_page_.ResetSmtLeds();
+                normal_page_.ShowBuildSignature(); // LOOPER: which build is this?
             }
 
             if (normal_page_.getRecordReset()) {
