@@ -851,7 +851,7 @@ class NoteLooper : public looper::Output
                 }
                 break;
                 case Nav::PAGE: view_start_ = ((end - 1) / bar + 1) * bar; break;
-                               case Nav::ADD:
+               case Nav::ADD:
                 {
                     // U5: enough dormant bars to fill the window, like seeding a new loop
                     const int32_t old_limit = EditLimit();
