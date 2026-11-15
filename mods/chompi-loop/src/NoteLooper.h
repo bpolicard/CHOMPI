@@ -7,17 +7,18 @@
  *  live quantize they can wait for the next grid line. They still reach the engines
  *  in the same audio block as before when they don't have to wait.
  *
- *  It also holds the Chroma key transpose (CHOMPI + the pitch knob, in fourths and
- *  fifths) and maps every Chroma note to the key that plays that pitch at the current
+ *  It also holds the Chroma key transpose (the pitch knob, in fourths and fifths)
+ *  and maps every Chroma note to the key that plays that pitch at the current
  *  transpose, so the key LEDs follow the pitches as you transpose.
  *
  *  And it runs the step view: Play + Loop held for a second switches the keys from
- *  playing notes to showing and editing the loop, one step of the quantize grid
- *  per key.
+ *  playing notes to showing and editing the loop. The 15 white keys are a window
+ *  of 15 steps of the current grid; the end black keys slide the window and can
+ *  append a dormant bar past the loop's end (U5).
  *
  *  Threading: two contexts talk to the looper.
  *   - Main loop (UI pages): Queue...() calls and the Set...() / ...Grid() setters.
- *     Notes and edits go through a FIFO.
+ *     Notes, edits and navigation go through a FIFO.
  *   - Audio callback (ui.GenerateEvents, MidiManager, AudioCallback): everything else,
  *     called directly. Process() runs once per audio block in the same context.
  */
@@ -39,6 +40,20 @@ namespace looper_ui
  *  MIDI notes 48-72. */
 static const int8_t kKeyOrder[25]
     = {15, 7, 8, 12, 9, 10, 13, 11, 14, 16, 21, 17, 18, 22, 19, 23, 20, 24, 29, 25, 30, 26, 31, 27, 28};
+
+/** U5: the 15 white keys left to right, and the 10 black keys left to right. */
+static const int8_t kWhiteKeys[15] = {15, 8, 9, 10, 11, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28};
+static const int8_t kBlackKeys[10] = {7, 12, 13, 14, 21, 22, 23, 29, 30, 31};
+static const int8_t kBlackFirst    = 7;  // leftmost black key: back
+static const int8_t kBlackLast     = 31; // rightmost black key: forward
+
+static inline bool IsBlackKey(int id)
+{
+    for(int i = 0; i < 10; i++)
+        if(kBlackKeys[i] == id)
+            return true;
+    return false;
+}
 } // namespace looper_ui
 
 struct LooperInput
@@ -48,13 +63,14 @@ struct LooperInput
         NOTE_ON,
         NOTE_OFF,
         STEP_EDIT,
+        STEP_NAV, // U5
     };
     Type    type;
     uint8_t engine;
     int8_t  key;
     int8_t  nn;
     uint8_t note;
-    int8_t  step;  // STEP_EDIT: step on the current page
+    int8_t  step;  // STEP_EDIT: step on the page. STEP_NAV: +1 forward, -1 back
     bool    sound; // NOTE_ON: the looper sounds the note (and stops it on NOTE_OFF)
                    // STEP_EDIT: first note of this press (decides erase vs. add)
 };
@@ -66,9 +82,19 @@ class NoteLooper : public looper::Output
     static constexpr uint32_t kClearHoldMs    = 1000; // shift + hold Loop
     static constexpr uint32_t kViewHoldMs     = 1000; // Play + Loop: step view
     static constexpr uint32_t kGridShowMs     = 1500; // grid display after a change
-    static constexpr int      kMaxPageSteps   = 24;   // keys used by the step view
+    static constexpr uint32_t kNavHoldMs      = 1500; // U5: no playhead-follow after a nav press
+    static constexpr int      kViewSteps      = 15;   // U5: the white keys
     static constexpr int      kFirstKey       = 7;    // Hardware::SwId range of the 25 keys
     static constexpr int      kLastKey        = 31;
+
+    /** U5: what the end black keys will do, for their LEDs. */
+    enum class Nav : uint8_t
+    {
+        OFF,    // nothing there
+        WITHIN, // green: reveal the hidden part of this bar
+        PAGE,   // purple: to the next / previous bar
+        ADD,    // red: append a dormant bar (forward only)
+    };
 
     void Init(BaseEngine           **engines,
               chompi::Hardware      *hw,
@@ -99,10 +125,15 @@ class NoteLooper : public looper::Output
         selected_          = 0;
         swallowed_         = 0;
         view_tick_         = 0;
-        view_page_start_   = 0;
+        view_start_        = 0;
         view_mask_         = 0;
         view_play_         = -1;
         view_active_steps_ = 0;
+        nav_fwd_ = nav_back_ = Nav::OFF;
+        nav_ms_            = 0;
+        play_in_view_      = false;
+        for(auto &g : view_grid_)
+            g = -1;
         edit_ok_ = edit_erase_ = false;
 
         initialized_ = true;
@@ -116,9 +147,9 @@ class NoteLooper : public looper::Output
     // ------------- main loop side (UI pages) -------------
 
     /** A key press. nn / note: the pitch to play, with the Chroma transpose already
-     *  applied (the note is recorded at that pitch). sound: the looper sounds it (and
-     *  stops it on the release); otherwise it's only recorded (something else is
-     *  sounding it). */
+     *  applied (the note is recorded at that pitch). In Slice, nn is the slice + 1
+     *  (0 = whatever the key plays now). sound: the looper sounds it (and stops it
+     *  on the release); otherwise it's only recorded (something else is sounding it). */
     void QueueNoteOn(uint8_t engine, int key, float nn, uint8_t note, bool sound)
     {
         LooperInput in{LooperInput::Type::NOTE_ON,
@@ -150,6 +181,13 @@ class NoteLooper : public looper::Output
                        note,
                        static_cast<int8_t>(step),
                        first};
+        input_fifo_.PushBack(in);
+    }
+
+    /** U5: step view: slide the window (+1 forward, -1 back). */
+    void QueueStepNav(int dir)
+    {
+        LooperInput in{LooperInput::Type::STEP_NAV, 0, 0, 0, 0, static_cast<int8_t>(dir > 0 ? 1 : -1), false};
         input_fifo_.PushBack(in);
     }
 
@@ -199,12 +237,12 @@ class NoteLooper : public looper::Output
 
     // ------------- Chroma key transpose (main loop) -------------
     //
-    // In Chroma, CHOMPI + the pitch knob moves the keys instead of re-pitching the
-    // sample: a key plays (and sends over MIDI) its note plus the transpose. Steps
-    // alternate a fifth and a fourth, like TEMPO's stepped pitch, so two clicks make
-    // an octave: 0, +7, +12, +19, +24 ... and 0, -5, -12, -17, -24 ..., up to 4 octaves
-    // either way. Only notes you play (or place) from then on are affected; the loop
-    // keeps its pitches.
+    // In Chroma, the pitch knob moves the keys instead of re-pitching the sample: a
+    // key plays (and sends over MIDI) its note plus the transpose. Steps alternate a
+    // fifth and a fourth, like TEMPO's stepped pitch, so two clicks make an octave:
+    // 0, +7, +12, +19, +24 ... and 0, -5, -12, -17, -24 ..., up to 4 octaves either
+    // way. Only notes you play (or place) from then on are affected; the loop keeps
+    // its pitches.
 
     static constexpr int kMaxTransposeSteps = 8;  // 4 octaves
     static constexpr int kMaxTranspose      = 48; // semitones
@@ -221,7 +259,7 @@ class NoteLooper : public looper::Output
         knob_turns_     = 0;
     }
 
-    /** Turn the pitch knob with CHOMPI held, in Chroma. */
+    /** Turn the pitch knob in Chroma. */
     void StepTranspose(int turns)
     {
         knob_turns_ += turns;
@@ -242,9 +280,10 @@ class NoteLooper : public looper::Output
 
     // ------------- step view (main loop reads, audio callback writes) -------------
     //
-    // One key per step of the current quantize grid (1/16 when the grid is off), in
-    // pages of whole bars: up to 24 keys, or a bar split into equal pages when it has
-    // more steps than that. The page follows the playhead.
+    // U5: the 15 white keys show 15 consecutive steps of the current quantize grid
+    // (1/16 when the grid is off), starting at view_start_. The end black keys slide
+    // the window: by the hidden part of the current bar (green), to the next or
+    // previous bar (purple), or past the loop's end into a new dormant bar (red).
 
     /** Which engine the step view shows (the UI's current engine). */
     void SetViewEngine(uint8_t engine) { view_engine_ = engine > 1 ? 1 : engine; }
@@ -259,28 +298,27 @@ class NoteLooper : public looper::Output
     }
     int32_t ViewGridUnits() const { return looper::kGridUnits[ViewGridIndex()]; }
 
-    /** Keys used by the step view: whole bars up to 24 keys, or an equal fraction of
-     *  a bar when a bar has more steps than that. */
-    int PageSteps() const
-    {
-        const int spb = looper::kUnitsPerBar / ViewGridUnits(); // steps per bar
-        if(spb <= kMaxPageSteps)
-            return (kMaxPageSteps / spb) * spb;
-        return spb / ((spb + kMaxPageSteps - 1) / kMaxPageSteps);
-    }
+    /** Steps shown: always the 15 white keys. */
+    int ViewSteps() const { return kViewSteps; }
 
-    /** Bit i: a note of the view engine starts in step i of the page. */
+    /** Bit i: a note of the view engine starts in step i of the window. */
     uint32_t StepMask() const { return view_mask_; }
-    /** Step of the page the playhead is in, -1 when the transport is stopped. */
+    /** Grid (index into kGridUnits) of the note(s) starting in step i, -1 if none. */
+    int StepGridAt(int i) const { return i >= 0 && i < kViewSteps ? view_grid_[i] : -1; }
+    /** Step of the window the playhead is in, -1 when off the window or stopped. */
     int PlayStep() const { return view_play_; }
+    /** Steps of the window that are inside the loop or a dormant bar (editable). */
+    int ActiveSteps() const { return view_active_steps_; }
+    /** What the forward / back black keys will do. */
+    Nav NavForward() const { return nav_fwd_; }
+    Nav NavBack() const { return nav_back_; }
 
-    /** The step (0-based, on the page) a key stands for, or -1 if that key isn't
-     *  part of the step view at the current grid. */
+    /** The step (0-based, in the window) a white key stands for, or -1. */
     int StepIndexOfKey(int key) const
     {
-        for(int i = 0; i < 25; i++)
-            if(looper_ui::kKeyOrder[i] == key)
-                return i < PageSteps() ? i : -1;
+        for(int i = 0; i < kViewSteps; i++)
+            if(looper_ui::kWhiteKeys[i] == key)
+                return i;
         return -1;
     }
 
@@ -380,7 +418,10 @@ class NoteLooper : public looper::Output
             loop_down_  = false;
             view_armed_ = false;
             if(loop_shift_ && !loop_clear_fired_)
+            {
                 core_.Undo();
+                view_tick_ = 0; // U5: show the result right away
+            }
             loop_shift_ = false;
         }
     }
@@ -464,6 +505,7 @@ class NoteLooper : public looper::Output
                     break;
                 case LooperInput::Type::NOTE_OFF: core_.NoteOff(in.key); break;
                 case LooperInput::Type::STEP_EDIT: StepEdit(in); break;
+                case LooperInput::Type::STEP_NAV: StepNav(in.step, now_ms); break;
             }
         }
 
@@ -501,7 +543,7 @@ class NoteLooper : public looper::Output
         if(step_view_)
         {
             if((view_tick_ & 7) == 0)
-                UpdateStepView();
+                UpdateStepView(now_ms);
             view_tick_++;
         }
 
@@ -681,18 +723,35 @@ class NoteLooper : public looper::Output
             for(int k = kFirstKey; k <= kLastKey; k++)
                 if(hw_->button_sr.State(k))
                     sel |= 1u << k;
-            selected_  = sel;
-            view_tick_ = 0;
+            selected_   = sel;
+            view_tick_  = 0;
+            nav_ms_     = 0;
+            view_start_ = FollowStart(PlayheadUnits());
+            play_in_view_ = false;
+        }
+        else
+        {
+            core_.TrimDormantBars(0); // U5: leaving the view drops dormant bars
         }
     }
 
-    /** How far into the loop steps can be edited: the loop's length, the bars
-     *  recorded so far on a first pass, or one bar when there's no loop yet. */
+    /** Steps per bar at the view grid. */
+    int32_t StepsPerBar() const { return looper::kUnitsPerBar / ViewGridUnits(); }
+
+    /** U5: bars a new loop needs to fill the 15-key window. */
+    int32_t SeedBars() const
+    {
+        const int32_t spb = StepsPerBar();
+        return (kViewSteps + spb - 1) / spb;
+    }
+
+    /** How far the step view may reach: the loop plus its dormant bars, the bars
+     *  recorded so far on a first pass, or enough empty bars to fill the window
+     *  when there's no loop yet. */
     int32_t EditLimit() const
     {
-        const int32_t len = core_.GetLength();
-        if(len > 0)
-            return len;
+        if(core_.GetLength() > 0)
+            return core_.EditLength();
         if(core_.GetState() == looper::State::RECORDING)
         {
             int32_t p = core_.GetPosition();
@@ -700,39 +759,200 @@ class NoteLooper : public looper::Output
                 p = 0;
             return (p / looper::kUnitsPerBar + 1) * looper::kUnitsPerBar;
         }
-        return looper::kUnitsPerBar;
+        return SeedBars() * looper::kUnitsPerBar;
     }
 
-    void UpdateStepView()
+    /** Where the playhead is for the view: the loop's position, or the clock's bar
+     *  phase when there's no loop yet. */
+    int32_t PlayheadUnits() const
     {
-        const int32_t       g     = ViewGridUnits();
-        const int           steps = PageSteps();
-        const looper::State st    = core_.GetState();
-        const bool          has   = st == looper::State::RECORDING || st == looper::State::PLAYING
+        const looper::State st = core_.GetState();
+        const bool has = st == looper::State::RECORDING || st == looper::State::PLAYING
                          || st == looper::State::OVERDUB;
-        // no loop yet: the clock's bar phase stands in for the playhead
         int32_t pos = has ? core_.GetPosition() : (core_.IsRunning() ? bar_phase_ : 0);
-        if(pos < 0)
-            pos = 0;
-        const int32_t step = pos / g;
-        view_page_start_   = (step / steps) * steps * g;
-        view_mask_         = has ? core_.StepMask(view_engine_, view_page_start_, g, steps) : 0;
-        view_play_         = core_.IsRunning() ? static_cast<int8_t>(step - view_page_start_ / g) : -1;
-        int n              = static_cast<int>((EditLimit() - view_page_start_) / g);
-        view_active_steps_ = n < 0 ? 0 : (n > steps ? steps : n);
+        return pos < 0 ? 0 : pos;
+    }
+
+    /** Window start that shows `pos`: its bar's start, or, when the bar is wider
+     *  than the window, a window ending on its step. */
+    int32_t FollowStart(int32_t pos) const
+    {
+        const int32_t g = ViewGridUnits();
+        const int32_t w = kViewSteps * g;
+        int32_t s = (pos / looper::kUnitsPerBar) * looper::kUnitsPerBar;
+        if(pos >= s + w)
+            s = (pos / g - (kViewSteps - 1)) * g;
+        return ClampStart(s);
+    }
+
+    /** Keep a window start on the grid and inside the editable range. */
+    int32_t ClampStart(int32_t s) const
+    {
+        const int32_t g = ViewGridUnits();
+        int32_t max_start = EditLimit() - kViewSteps * g;
+        if(max_start < 0)
+            max_start = 0;
+        if(s > max_start)
+            s = max_start;
+        if(s < 0)
+            s = 0;
+        return s - (s % g);
+    }
+
+    /** U5: what the end keys would do from the current window. */
+    void UpdateNav()
+    {
+        const int32_t g     = ViewGridUnits();
+        const int32_t w     = kViewSteps * g;
+        const int32_t bar   = looper::kUnitsPerBar;
+        const int32_t limit = EditLimit();
+        const int32_t end   = view_start_ + w;
+
+        if(end >= limit)
+        {
+            const bool can_add = core_.GetLength() > 0 && core_.GetState() != looper::State::RECORDING
+                                 && limit / bar < looper::kMaxBars;
+            nav_fwd_ = can_add ? Nav::ADD : Nav::OFF;
+        }
+        else
+        {
+            const int32_t bar_end = ((end - 1) / bar + 1) * bar;
+            nav_fwd_              = end < bar_end ? Nav::WITHIN : Nav::PAGE;
+        }
+
+        if(view_start_ <= 0)
+            nav_back_ = Nav::OFF;
+        else
+        {
+            const int32_t bar_start = (view_start_ / bar) * bar;
+            nav_back_               = view_start_ > bar_start ? Nav::WITHIN : Nav::PAGE;
+        }
+    }
+
+    /** U5: a forward / back press (audio callback). */
+    void StepNav(int dir, uint32_t now_ms)
+    {
+        if(!step_view_)
+            return;
+        UpdateNav();
+        const int32_t g   = ViewGridUnits();
+        const int32_t w   = kViewSteps * g;
+        const int32_t bar = looper::kUnitsPerBar;
+        if(dir > 0)
+        {
+            const int32_t end = view_start_ + w;
+            switch(nav_fwd_)
+            {
+                case Nav::WITHIN:
+                {
+                    const int32_t bar_end = ((end - 1) / bar + 1) * bar;
+                    const int32_t hidden  = bar_end - end;
+                    view_start_ += hidden < w ? hidden : w;
+                }
+                break;
+                case Nav::PAGE: view_start_ = ((end - 1) / bar + 1) * bar; break;
+                               case Nav::ADD:
+                {
+                    // U5: enough dormant bars to fill the window, like seeding a new loop
+                    const int32_t old_limit = EditLimit();
+                    int32_t       added     = 0;
+                    for(int32_t i = 0; i < SeedBars(); i++)
+                        if(core_.AppendDormantBar())
+                            added++;
+                    if(added > 0)
+                        view_start_ = old_limit; // the first new bar's start
+                }
+                break;
+                default: break;
+            }
+        }
+        else
+        {
+            switch(nav_back_)
+            {
+                case Nav::WITHIN:
+                {
+                    const int32_t bar_start = (view_start_ / bar) * bar;
+                    const int32_t hidden    = view_start_ - bar_start;
+                    view_start_ -= hidden < w ? hidden : w;
+                }
+                break;
+                case Nav::PAGE: view_start_ -= w; break;
+                default: break;
+            }
+        }
+        view_start_ = ClampStart(view_start_);
+        TrimDormantToView();
+        view_start_ = ClampStart(view_start_);
+        nav_ms_       = now_ms;
+        play_in_view_ = false;
+        view_tick_    = 0; // redraw now
+    }
+
+    /** U5: dormant bars the window no longer reaches are dropped. */
+    void TrimDormantToView()
+    {
+        const int32_t len = core_.GetLength();
+        if(len <= 0 || core_.GetDormantBars() == 0)
+            return;
+        const int32_t end = view_start_ + kViewSteps * ViewGridUnits();
+        int32_t keep = 0;
+        if(end > len)
+            keep = (end - 1) / looper::kUnitsPerBar + 1 - len / looper::kUnitsPerBar;
+        core_.TrimDormantBars(keep);
+    }
+
+    void UpdateStepView(uint32_t now_ms)
+    {
+        const int32_t g     = ViewGridUnits();
+        const int32_t w     = kViewSteps * g;
+        const looper::State st = core_.GetState();
+        const bool has = st == looper::State::RECORDING || st == looper::State::PLAYING
+                         || st == looper::State::OVERDUB;
+        const int32_t pos = PlayheadUnits();
+
+        view_start_ = ClampStart(view_start_);
+
+        // follow the playhead when it runs off the window, unless you've just navigated
+        const bool in_view = core_.IsRunning() && pos >= view_start_ && pos < view_start_ + w;
+        if(core_.IsRunning() && !in_view && play_in_view_ && now_ms - nav_ms_ >= kNavHoldMs)
+        {
+            view_start_ = FollowStart(pos);
+            TrimDormantToView();
+            view_start_ = ClampStart(view_start_);
+        }
+        play_in_view_ = core_.IsRunning() && pos >= view_start_ && pos < view_start_ + w;
+
+        const int32_t limit = EditLimit();
+        int n               = static_cast<int>((limit - view_start_) / g);
+        view_active_steps_  = n < 0 ? 0 : (n > kViewSteps ? kViewSteps : n);
+
+        uint32_t mask = 0;
+        for(int i = 0; i < kViewSteps; i++)
+        {
+            const int32_t from = view_start_ + i * g;
+            const int grid = has ? core_.StepGrid(view_engine_, from, from + g) : -1;
+            view_grid_[i]  = static_cast<int8_t>(grid);
+            if(grid >= 0)
+                mask |= 1u << i;
+        }
+        view_mask_ = mask;
+        view_play_ = play_in_view_ ? static_cast<int8_t>((pos - view_start_) / g) : -1;
+
+        UpdateNav();
     }
 
     /** One step of a step press (several for a chord, first = the first). */
     void StepEdit(const LooperInput &in)
     {
         const int32_t g    = ViewGridUnits();
-        const int32_t from = view_page_start_ + static_cast<int32_t>(in.step) * g;
+        const int32_t from = view_start_ + static_cast<int32_t>(in.step) * g;
         if(in.sound) // first note of this press: decide between erase and add
         {
-            edit_ok_ = in.step >= 0 && in.step < view_active_steps_; // past the loop end: inert
+            edit_ok_ = in.step >= 0 && in.step < view_active_steps_; // past the end: inert
             if(edit_ok_)
             {
-                core_.EnsureLoop(bar_phase_);
+                core_.EnsureLoop(bar_phase_, SeedBars());
                 core_.BeginEditPass();
                 edit_erase_ = core_.HasNotesIn(in.engine, from, from + g);
                 if(edit_erase_)
@@ -807,10 +1027,15 @@ class NoteLooper : public looper::Output
     volatile uint32_t selected_;          // keys whose notes a step press places (bit = SwId)
     uint32_t          swallowed_;         // keys taken while Play + Loop are held
     uint8_t           view_tick_;
-    int32_t           view_page_start_;   // loop position of the page's first step
+    int32_t           view_start_;        // U5: loop position of the window's first step
     volatile uint32_t view_mask_;
+    volatile int8_t   view_grid_[kViewSteps]; // U5: grid of each step's note(s), -1 = none
     volatile int8_t   view_play_;
-    int               view_active_steps_; // steps on the page that are inside the loop
-    bool              edit_ok_;           // current press: within the loop
+    int               view_active_steps_; // steps of the window inside the editable range
+    volatile Nav      nav_fwd_;           // U5
+    volatile Nav      nav_back_;          // U5
+    uint32_t          nav_ms_;            // U5: last nav press
+    bool              play_in_view_;      // U5: the playhead was inside the window last update
+    bool              edit_ok_;           // current press: within the editable range
     bool              edit_erase_;        // current press: erasing rather than adding
 };
