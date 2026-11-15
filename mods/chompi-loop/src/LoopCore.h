@@ -13,7 +13,9 @@
  *  playing is what gets recorded.
  *
  *  The step view edits the loop directly: InsertNote / EraseRange / HasNotesIn /
- *  StepMask, each edit as its own undo layer (BeginEditPass).
+ *  StepMask, each edit as its own undo layer (BeginEditPass). It can also append
+ *  "dormant" bars past the loop's end: they are shown and editable but not part of
+ *  the loop until the first note is placed in one (AppendDormantBar).
  */
 #pragma once
 #include <cstddef>
@@ -24,7 +26,7 @@ namespace looper
 
 constexpr int32_t  kUnitsPerTick   = 32;
 constexpr int32_t  kUnitsPerBeat   = 24 * kUnitsPerTick; // 768
-constexpr int32_t  kBeatsPerBar    = 4;                  // 4/4 for now
+constexpr int32_t  kBeatsPerBar    = 4;                  // 4/4, always
 constexpr int32_t  kUnitsPerBar    = kUnitsPerBeat * kBeatsPerBar;
 constexpr int32_t  kMaxBars        = 60;
 constexpr int32_t  kMaxLength      = kMaxBars * kUnitsPerBar;
@@ -63,7 +65,7 @@ struct Event
                       // While kFlagErased is set: the pass the note belonged to.
     uint32_t dur_us;  // note length in µs. While kFlagHeld is set: the note-on time.
     int8_t   key;     // engine voice id (Hardware::SwId value)
-    int8_t   nn;      // transpose in semitones
+    int8_t   nn;      // transpose in semitones (Slice: slice + 1, 0 = by key)
     uint8_t  engine;  // 0 = chroma, 1 = slice
     uint8_t  note;    // MIDI note number, for MIDI out
     uint16_t pass;    // recording pass number, for undo (an erased note: the erasing pass)
@@ -326,7 +328,8 @@ class LoopCore
     }
 
     /** Remove the most recent recording pass (or step edit). Notes that pass erased
-     *  come back. Undoing the first take clears the loop. */
+     *  come back; bars that pass opened close again. Undoing the first take clears
+     *  the loop. */
     void Undo()
     {
         if(state_ == State::ARMED || state_ == State::RECORDING)
@@ -362,6 +365,20 @@ class LoopCore
         pass_       = last - 1;
         if(state_ == State::OVERDUB)
             state_ = State::PLAYING;
+
+        // DORMANT: the bars this pass opened (by placing the first note in them)
+        // close again, and become dormant so the view they were in still exists.
+        while(len_ > kUnitsPerBar && bar_pass_[len_ / kUnitsPerBar - 1] == last)
+        {
+            bar_pass_[len_ / kUnitsPerBar - 1] = 0;
+            len_ -= kUnitsPerBar;
+            dormant_bars_++;
+        }
+        if(pos_ >= len_)
+        {
+            pos_       = Mod(pos_, len_);
+            scan_from_ = pos_ - 1;
+        }
     }
 
     /** Clear the loop. (Notes you're playing by hand carry on.) */
@@ -373,14 +390,18 @@ class LoopCore
 
     // ---------------- step view edits ----------------
 
-    /** Make sure there's a loop to edit. With none, create an empty 1-bar loop and
-     *  play it. If the transport is already running, the loop started at the last
-     *  bar line (phase = units since it); otherwise it starts now, as a first note
-     *  would (realigning the internal clock). */
-    void EnsureLoop(int32_t phase)
+    /** Make sure there's a loop to edit. With none, create an empty loop of `bars`
+     *  bars and play it. If the transport is already running, the loop started at
+     *  the last bar line (phase = units since it); otherwise it starts now, as a
+     *  first note would (realigning the internal clock). */
+    void EnsureLoop(int32_t phase, int32_t bars = 1) // U5: bars
     {
         if(state_ != State::EMPTY && state_ != State::ARMED)
             return;
+        if(bars < 1)
+            bars = 1;
+        if(bars > kMaxBars)
+            bars = kMaxBars;
         if(running_)
         {
             pass_ = 1;
@@ -390,7 +411,7 @@ class LoopCore
             BeginFirstPass();
         num_events_          = 0;
         full_                = false;
-        len_                 = kUnitsPerBar;
+        len_                 = bars * kUnitsPerBar;
         state_               = State::PLAYING;
         scan_from_           = pos_ - 1;
         overdub_after_close_ = false;
@@ -398,6 +419,36 @@ class LoopCore
 
     /** Start a new undo layer for the edit(s) that follow. */
     void BeginEditPass() { pass_ = MaxPass() + 1; }
+
+    // DORMANT bars: shown and editable past the loop's end, but the loop keeps
+    // wrapping at its old length until a note is placed in one. Then every bar up
+    // to that one joins the loop (as part of the current edit pass, so Undo takes
+    // them out again).
+
+    /** Append one dormant bar. Returns false if there's no loop or no room. */
+    bool AppendDormantBar()
+    {
+        if(len_ <= 0 || state_ == State::RECORDING)
+            return false;
+        if(len_ / kUnitsPerBar + dormant_bars_ >= kMaxBars)
+            return false;
+        dormant_bars_++;
+        return true;
+    }
+
+    /** Keep at most `keep` dormant bars (0 drops them all). */
+    void TrimDormantBars(int32_t keep)
+    {
+        if(keep < 0)
+            keep = 0;
+        if(dormant_bars_ > keep)
+            dormant_bars_ = keep;
+    }
+
+    int32_t GetDormantBars() const { return dormant_bars_; }
+
+    /** Loop length plus the dormant bars: how far the step view may reach. */
+    int32_t EditLength() const { return len_ + dormant_bars_ * kUnitsPerBar; }
 
     /** Any note of this engine starting in [from, to)? */
     bool HasNotesIn(uint8_t engine, int32_t from, int32_t to) const
@@ -436,7 +487,8 @@ class LoopCore
     }
 
     /** Add a note at a position in the loop (a step start), dur_us long. It plays
-     *  when the playhead gets there. Needs a loop (see EnsureLoop). */
+     *  when the playhead gets there. Needs a loop (see EnsureLoop). A position in
+     *  a dormant bar wakes that bar (and any before it) into the loop. */
     bool InsertNote(uint8_t  engine,
                     int8_t   key,
                     int8_t   nn,
@@ -453,7 +505,11 @@ class LoopCore
             return false;
         }
         if(len_ > 0)
+        {
+            if(pos >= len_ && pos < EditLength())
+                WakeBarsThrough(pos); // DORMANT
             pos = Mod(pos, len_);
+        }
         Event &e  = events_[num_events_++];
         e.pos     = pos;
         e.rec_odo = odo_ - static_cast<uint32_t>(len_); // never "just played live"
@@ -489,6 +545,22 @@ class LoopCore
             m |= 1u << ((q - from) / step_units);
         }
         return m;
+    }
+
+    /** U5: the grid of the first note of this engine starting in [from, to),
+     *  or -1 if none. (For the step view's note colours.) */
+    int StepGrid(uint8_t engine, int32_t from, int32_t to) const
+    {
+        for(size_t i = 0; i < num_events_; i++)
+        {
+            const Event &e = events_[i];
+            if(e.engine != engine || (e.flags & kFlagErased))
+                continue;
+            const int32_t q = Quantized(e);
+            if(q >= from && q < to)
+                return e.grid;
+        }
+        return -1;
     }
 
     // ---------------- queries ----------------
@@ -608,6 +680,17 @@ class LoopCore
         return m;
     }
 
+    /** DORMANT: the bars from the loop's end up to the one holding `pos` join the
+     *  loop, credited to the current edit pass. */
+    void WakeBarsThrough(int32_t pos)
+    {
+        const int32_t new_len = (pos / kUnitsPerBar + 1) * kUnitsPerBar;
+        for(int32_t b = len_ / kUnitsPerBar; b < new_len / kUnitsPerBar; b++)
+            bar_pass_[b] = pass_;
+        dormant_bars_ -= (new_len - len_) / kUnitsPerBar;
+        len_ = new_len;
+    }
+
     void ClearAll()
     {
         state_       = State::EMPTY;
@@ -618,6 +701,9 @@ class LoopCore
         pass_        = 0;
         full_        = false;
         overdub_after_close_ = false;
+        dormant_bars_ = 0; // DORMANT
+        for(auto &b : bar_pass_)
+            b = 0;
     }
 
     void BeginFirstPass()
@@ -948,6 +1034,9 @@ class LoopCore
     int32_t  scan_from_; // last position already scanned (exclusive), -1 = include 0
     uint16_t pass_;
     uint32_t odo_;       // playhead odometer: total units travelled while running
+
+    int32_t  dormant_bars_;      // DORMANT: bars past len_ the step view may edit
+    uint16_t bar_pass_[kMaxBars]; // DORMANT: pass that woke each bar (0 = the take)
 
     int     record_grid_;
     int32_t strength_;
