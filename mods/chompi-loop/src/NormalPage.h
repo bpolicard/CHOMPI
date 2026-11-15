@@ -130,6 +130,26 @@ namespace chompi
 
     static const uint8_t knob_num_pages[6] = {3, 2, 2, 2, 1, 2};
 
+    /** U5: one colour per quantize grid, used for notes (both views), the left
+     *  tempo light, and the grid display. Red is reserved for the playhead.
+     *  1/4   1/4T  1/8   1/8T    1/16   1/16T  1/32    1/32T   off */
+    static const float *kGridColor[looper::kNumGrids]
+        = {green, teal, blue, purple, white, pink, orange, yellow, white};
+    static const float kGridLevel[looper::kNumGrids] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, .3f};
+
+    /** U5: colour of a grid, scaled by level, into r g b. Out-of-range grid = off. */
+    static void GridColor(int grid, float level, float &r, float &g, float &b)
+    {
+        if (grid < 0 || grid >= looper::kNumGrids) {
+            r = g = b = 0.f;
+            return;
+        }
+        const float lv = level * kGridLevel[grid];
+        r = kGridColor[grid][0] * lv;
+        g = kGridColor[grid][1] * lv;
+        b = kGridColor[grid][2] * lv;
+    }
+
     /** LOOPER: LED brightness for a pulse that peaks on each line of a grid and fades
      *  until the next one. phase: units since the last line; period: units per line;
      *  floor: brightness between pulses. */
@@ -151,10 +171,9 @@ namespace chompi
         b = color_xfade(from[2], to[2], t);
     }
 
-    /** LOOPER: for a moment after the quantize grid changes, show it on white keys 1-9.
-     *  Keys 1-8: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T (straight = teal,
-     *  triplet = pink). Key 9: off (white). Bright = grid for new notes; medium = the
-     *  grid you scrolled to, when you've hopped away from it with shift; dim = the rest.
+    /** LOOPER: for a moment after the quantize grid changes, show it on white keys 1-9,
+     *  each in its grid colour. Bright = grid for new notes; medium = the grid you
+     *  scrolled to, when you've hopped away from it with shift; dim = the rest.
      *  While the transport runs, each key pulses at its own subdivision's rate.
      *  Returns false and draws nothing when there's nothing to show. */
     static bool DrawLooperGrid(const NoteLooper *lp)
@@ -177,21 +196,24 @@ namespace chompi
         const int active = lp->ActiveGridIndex();
         const int home = lp->HomeGridIndex();
         for (int g = 0; g < looper::kNumGrids; g++) {
-            const float *c = g == looper::kGridOff ? white : (g % 2 ? pink : teal);
             float level = g == active ? 1.f : (g == home ? .4f : .15f);
             const int32_t units = looper::kGridUnits[g];
             if (running && units > 0) {
                 level *= LooperPulse(bar % units, units, .25f);
             }
-            SetSmtLedFloat(led_map[static_cast<int>(grid_keys[g])], c[0] * level, c[1] * level, c[2] * level);
+            float r, gg, b;
+            GridColor(g, level, r, gg, b); // U5
+            SetSmtLedFloat(led_map[static_cast<int>(grid_keys[g])], r, gg, b);
         }
         return true;
     }
 
-    /** LOOPER: the step view. One key per step of the current grid, left to right:
-     *  white = a note of the current engine starts here, red = the playhead,
-     *  yellow = both. Everything is either full on or off. Keys past the page are
-     *  dark. Returns false and draws nothing when the step view is off. */
+    /** U5: the step view. The 15 white keys are a window of 15 steps: a note lights
+     *  its key in the colour of the grid it was quantized to, the playhead is red
+     *  (and wins), everything else is dark. The end black keys show what pressing
+     *  them does: green = reveal the rest of this bar, purple = next / previous bar,
+     *  red = append dormant bars. The middle black keys are dark (reserved).
+     *  Returns false and draws nothing when the step view is off. */
     static bool DrawLooperSteps(const NoteLooper *lp)
     {
         if (!lp || !lp->InStepView()) {
@@ -200,17 +222,34 @@ namespace chompi
         for (size_t i = 7; i < 25 + 7; i++) {
             SetSmtLed(led_map[i], 0, 0, 0);
         }
-        const int n = lp->PageSteps();
-        const uint32_t mask = lp->StepMask();
         const int play = lp->PlayStep();
-        for (int i = 0; i < n; i++) {
-            const bool note = (mask >> i) & 1u;
-            const bool here = i == play;
-            if (!note && !here) {
+        for (int i = 0; i < NoteLooper::kViewSteps; i++) {
+            const int led = led_map[static_cast<int>(looper_ui::kWhiteKeys[i])];
+            if (i == play) {
+                SetSmtLedFloat(led, red[0], red[1], red[2]);
                 continue;
             }
-            const float *c = note && here ? yellow : (here ? red : white);
-            SetSmtLedFloat(led_map[static_cast<int>(looper_ui::kKeyOrder[i])], c[0], c[1], c[2]);
+            const int grid = lp->StepGridAt(i);
+            if (grid >= 0) {
+                float r, g, b;
+                GridColor(grid, 1.f, r, g, b);
+                SetSmtLedFloat(led, r, g, b);
+            }
+        }
+        // the end black keys: what a press would do
+        const NoteLooper::Nav navs[2] = {lp->NavBack(), lp->NavForward()};
+        const int nav_keys[2] = {looper_ui::kBlackFirst, looper_ui::kBlackLast};
+        for (int k = 0; k < 2; k++) {
+            const float *c = nullptr;
+            switch (navs[k]) {
+                case NoteLooper::Nav::WITHIN: c = green; break;
+                case NoteLooper::Nav::PAGE: c = purple; break;
+                case NoteLooper::Nav::ADD: c = red; break;
+                default: break;
+            }
+            if (c) {
+                SetSmtLedFloat(led_map[nav_keys[k]], c[0], c[1], c[2]);
+            }
         }
         return true;
     }
@@ -274,10 +313,6 @@ namespace chompi
 
             for (int i = 0; i < kNumSmtLeds; i++)
                 SetSmtLed(i, 0, 0, 0);
-            // SetSmtLedFloat(i, .1f, .1f, .0f);
-            // SetSmtLedFloat(0, 0.f, 0.f, 0.f);
-            // SetSmtLedFloat(9, 0.f, 0.f, 0.f);
-            // SetSmtLedFloat(10, 0.f, 0.f, 0.f);
 
             init_time = System::GetNow();
         }
@@ -288,8 +323,7 @@ namespace chompi
         void SetLooper(NoteLooper *looper) { looper_ = looper; }
 
         /** LOOPER: build signature. For 3 s after the boot rainbow, white keys 1-4 light
-         *  blue, so you can tell at a glance that this build (update-4) is the one on
-         *  the card. An older build shows nothing here. */
+         *  green (update-5), so you can tell at a glance which build is on the card. */
         void ShowBuildSignature() { signature_until_ = System::GetNow() + 3000; }
 
         void ResetSmtLeds()
@@ -339,7 +373,17 @@ namespace chompi
             for(size_t i = 7; i < (25 + 7); i++)
             {
                 if (arpSeq_->isKeyPlaying(i) || (arpSeq_->isRestPlaying(i) && arpSeq_->getPlay(1) && fx_->getEngine() == SLICE)) {
-                    SetSmtLedFloat(led_map[i], 1.f, 1.f, 1.f);
+                    // U5: a looped note lights its key in its grid's colour; a key you're
+                    // playing is white
+                    const int grid = looper_ ? looper_->KeyGrid(i) : -1;
+                    if (grid >= 0) {
+                        float r, g, b;
+                        GridColor(grid, 1.f, r, g, b);
+                        SetSmtLedFloat(led_map[i], r, g, b);
+                    }
+                    else {
+                        SetSmtLedFloat(led_map[i], 1.f, 1.f, 1.f);
+                    }
                 }
                 else if (arpSeq_->getLatch() && arpSeq_->isKeyInSeq(i, fx_->getEngine())) {
                     if (i == 28 && fx_->getEngine() == SLICE) {
@@ -358,6 +402,19 @@ namespace chompi
                 }
                 else {
                     SetSmtLed(led_map[i], 0, 0, 0);
+                }
+            }
+
+            // U5: Slice key mode: the end black keys slide the 15 keys over the 16
+            // slices; the one that still has somewhere to go lights dim purple
+            if (fx_->getEngine() == SLICE && !(looper_ && looper_->InStepView())) {
+                const int off = SliceOffset();
+                const float lv = .35f;
+                if (off == 0) {
+                    SetSmtLedFloat(led_map[looper_ui::kBlackLast], purple[0] * lv, purple[1] * lv, purple[2] * lv);
+                }
+                else {
+                    SetSmtLedFloat(led_map[looper_ui::kBlackFirst], purple[0] * lv, purple[1] * lv, purple[2] * lv);
                 }
             }
 
@@ -471,32 +528,28 @@ namespace chompi
                         SetPthLedFloat(6, leds_[3], leds_[4], leds_[5]);
                     }
                     else {
+                        // U5: the right light is the beat and is always green; the left
+                        // light is the quantize grid, in the grid's colour (green at
+                        // 1/4, when it pulses at the same rate). Running: both pulse.
+                        // Stopped: both dim. The tempo gradient is gone.
                         float leds_[6]; // left LED, then right LED
-                        if (clock_manager_->getClockMode() == FREE) {
-                            r = color_quad_xfade(med_blue[0], green[0], yellow[0], red[0], value);
-                            g = color_quad_xfade(med_blue[1], green[1], yellow[1], red[1], value);
-                            b = color_quad_xfade(med_blue[2], green[2], yellow[2], red[2], value);
+                        const int grid = looper_ ? looper_->ActiveGridIndex() : looper::kGridSixteenth;
+                        GridColor(grid, 1.f, leds_[0], leds_[1], leds_[2]);
+                        leds_[3] = green[0];
+                        leds_[4] = green[1];
+                        leds_[5] = green[2];
 
-                            leds_[0] = leds_[3] = r;
-                            leds_[1] = leds_[4] = g;
-                            leds_[2] = leds_[5] = b;
-                        }
-                        else {
-                            clock_manager_->fillLEDdata(leds_, fx_->getEngine());
-                        }
-                            
-                        // LOOPER: while the transport runs, the right LED pulses on the
-                        // beat and the left one at the quantize subdivision (steady dim
-                        // when the grid is off)
+                        float beat_lvl = .25f;
+                        float sub_lvl = .25f;
                         if (looper_ && looper_->IsRunning()) {
                             const int32_t bar = looper_->BarPhaseUnits();
-                            const int32_t sub = looper::kGridUnits[looper_->ActiveGridIndex()];
-                            const float beat_lvl = LooperPulse(bar % looper::kUnitsPerBeat, looper::kUnitsPerBeat, .08f);
-                            const float sub_lvl = sub > 0 ? LooperPulse(bar % sub, sub, .08f) : .3f;
-                            for (int c = 0; c < 3; c++) {
-                                leds_[c] *= sub_lvl;
-                                leds_[3 + c] *= beat_lvl;
-                            }
+                            const int32_t sub = looper::kGridUnits[grid];
+                            beat_lvl = LooperPulse(bar % looper::kUnitsPerBeat, looper::kUnitsPerBeat, .08f);
+                            sub_lvl = sub > 0 ? LooperPulse(bar % sub, sub, .08f) : .3f;
+                        }
+                        for (int c = 0; c < 3; c++) {
+                            leds_[c] *= sub_lvl;
+                            leds_[3 + c] *= beat_lvl;
                         }
 
                         SetPthLedFloat(5, leds_[0], leds_[1], leds_[2]);
@@ -654,12 +707,12 @@ namespace chompi
             // LOOPER: quantize grid display (overrides the keys for a moment)
             DrawLooperGrid(looper_);
 
-            // LOOPER: build signature (see ShowBuildSignature): white keys 1-4 blue
+            // LOOPER: build signature (see ShowBuildSignature): white keys 1-4 green
             if (signature_until_ != 0 && now < signature_until_) {
                 static const Hardware::SwId sig_keys[4] = {
                     Hardware::SwId::KEY_1, Hardware::SwId::KEY_2, Hardware::SwId::KEY_3, Hardware::SwId::KEY_4};
                 for (int k = 0; k < 4; k++) {
-                    SetSmtLedFloat(led_map[static_cast<int>(sig_keys[k])], blue[0], blue[1], blue[2]);
+                    SetSmtLedFloat(led_map[static_cast<int>(sig_keys[k])], green[0], green[1], green[2]);
                 }
             }
 
@@ -748,31 +801,7 @@ namespace chompi
 
             // toggle. We're not using this anymore, just here in case something breaks
             case static_cast<uint16_t>(Hardware::SwId::SW_TOG): // fall through
-                // switch_state = rising;
-                // if (!rising)
-                //     midi_channel = 0;
-
-                // some weirdness results in handling this on edges rather than as pressed
-                // for example if you hold the chompi key with the switch up then toggle the sw
-                // down, you'll be on ch 1 until you release and repress the chompi key
-                // then it will go to ch 2 like it should
                 break;
-
-            // CC buttons
-            // case static_cast<uint16_t>(Hardware::SwId::ENC_4_SW):
-            // {
-            //     if (!rising)
-            //     {
-            //         enc_values[0][0] = enc_defaults[0][0];
-            //         hw_->SendCC(midi_channel, cc_map[0][0], enc_values[0][0] * 127);
-
-            //         DumpValuePresets();
-            //         SetPthLedFloat(1, green[0], green[1], green[2]);
-            //     }
-
-            //     hw_->SendCC(midi_channel, key_map[buttonID], rising ? 127 : 0);
-            //     break;
-            // }
 
             // CC buttons
             case static_cast<uint16_t>(Hardware::SwId::KEY_27): // play
@@ -835,13 +864,21 @@ namespace chompi
             // keys
             default:
             {
-                // LOOPER: in the step view the keys edit the loop instead of playing.
-                // A key that was already sounding when the view opened is still
-                // released below.
+                const bool is_nav_key = buttonID == looper_ui::kBlackFirst || buttonID == looper_ui::kBlackLast;
+
+                // U5: in the step view the keys edit the loop instead of playing:
+                // white keys are steps, the end black keys slide the window, the
+                // middle black keys are reserved. A key that was already sounding
+                // when the view opened is still released below.
                 if (looper_ && looper_->InStepView()) {
                     if (rising) {
                         if (!isRetriggering) {
-                            StepPress(buttonID);
+                            if (is_nav_key) {
+                                looper_->QueueStepNav(buttonID == looper_ui::kBlackLast ? 1 : -1);
+                            }
+                            else if (!looper_ui::IsBlackKey(buttonID)) {
+                                StepPress(buttonID);
+                            }
                         }
                         break;
                     }
@@ -849,11 +886,23 @@ namespace chompi
                         break; // this press never started a note
                     }
                 }
+                // U5: Slice key mode: the end black keys slide the keyboard over the
+                // 16 slices instead of playing (they never played anything in Slice)
+                else if (fx_->getEngine() == SLICE && is_nav_key) {
+                    if (rising && !isRetriggering) {
+                        SetSliceOffset(buttonID == looper_ui::kBlackLast ? 1 : 0);
+                    }
+                    break;
+                }
 
                 // LOOPER: in Chroma the pitch knob transposes the keys (NoteLooper):
-                // a key plays, records and sends its note plus the transpose
+                // a key plays, records and sends its note plus the transpose.
+                // U5: in Slice, nn names the slice (slice + 1) so a recorded note keeps
+                // its slice whatever the slot window does later.
                 const int transpose = (fx_->getEngine() == CHROMATIC && looper_) ? looper_->Transpose() : 0;
-                const float transpose_nn = fx_->getEngine() == CHROMATIC ? static_cast<float>(key_map[buttonID] - 60 + transpose) : 0.f;
+                const float transpose_nn = fx_->getEngine() == CHROMATIC
+                                               ? static_cast<float>(key_map[buttonID] - 60 + transpose)
+                                               : SliceNn(buttonID);
                 const uint8_t midi_note = static_cast<uint8_t>(key_map[buttonID] + transpose);
                 if (rising)
                 {
@@ -1109,28 +1158,52 @@ namespace chompi
         inline void SetInitIgnore(bool ignore) { init_ignore = ignore; }
 
     private:
-        /** LOOPER: a key pressed in the step view: place the selected note(s) at that
-         *  step, or clear the step if it already has notes (NoteLooper decides). With
-         *  no selection, a random key's note is placed. Chroma notes take the current
-         *  transpose, as a key press would. */
+        /** U5: the Slice engine (engines_[SLICE] is a sliceEngine, see chompi_main) */
+        sliceEngine *Slice() { return static_cast<sliceEngine *>(engines_[SLICE]); }
+        int SliceOffset() { return Slice()->getSliceOffset(); }
+        void SetSliceOffset(int off) { Slice()->setSliceOffset(off); }
+
+        /** U5: the nn a Slice key sends: its slice + 1 at the current window, or 0 for
+         *  a key that plays no slice (so the engine ignores it as before). */
+        float SliceNn(int key)
+        {
+            if (key < 0 || key > 31 || sliceMap[key] == 99) {
+                return 0.f;
+            }
+            return static_cast<float>(static_cast<int>(sliceMap[key]) + SliceOffset() + 1);
+        }
+
+        /** LOOPER: a white key pressed in the step view: place the selected note(s) at
+         *  that step, or clear the step if it already has notes (NoteLooper decides).
+         *  With no selection, a random white key's note is placed. Chroma notes take
+         *  the current transpose, as a key press would; Slice notes take their slice
+         *  at the current window. */
         void StepPress(uint16_t buttonID)
         {
             const int step = looper_->StepIndexOfKey(buttonID);
             if (step < 0) {
-                return; // not a step key at this grid
+                return; // not a step key
             }
             const uint8_t eng = fx_->getEngine();
             const int transpose = eng == CHROMATIC ? looper_->Transpose() : 0;
             uint32_t sel = looper_->SelectedKeys();
+            if (eng == SLICE) {
+                // only keys that play a slice can be placed
+                for (int k = NoteLooper::kFirstKey; k <= NoteLooper::kLastKey; k++) {
+                    if (k > 31 || sliceMap[k] == 99) {
+                        sel &= ~(1u << k);
+                    }
+                }
+            }
             if (sel == 0) {
-                sel = 1u << looper_ui::kKeyOrder[RandomKeyIndex()];
+                sel = 1u << looper_ui::kWhiteKeys[RandomKeyIndex() % NoteLooper::kViewSteps];
             }
             bool first = true;
             for (int k = NoteLooper::kFirstKey; k <= NoteLooper::kLastKey; k++) {
                 if (!((sel >> k) & 1u)) {
                     continue;
                 }
-                const float nn = eng == CHROMATIC ? static_cast<float>(key_map[k] - 60 + transpose) : 0.f;
+                const float nn = eng == CHROMATIC ? static_cast<float>(key_map[k] - 60 + transpose) : SliceNn(k);
                 const uint8_t note = static_cast<uint8_t>(key_map[k] + transpose);
                 looper_->QueueStepEdit(eng, step, k, nn, note, first);
                 first = false;

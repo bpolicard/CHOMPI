@@ -14,7 +14,7 @@
  *  And it runs the step view: Play + Loop held for a second switches the keys from
  *  playing notes to showing and editing the loop. The 15 white keys are a window
  *  of 15 steps of the current grid; the end black keys slide the window and can
- *  append a dormant bar past the loop's end (U5).
+ *  append dormant bars past the loop's end (U5).
  *
  *  Threading: two contexts talk to the looper.
  *   - Main loop (UI pages): Queue...() calls and the Set...() / ...Grid() setters.
@@ -86,6 +86,7 @@ class NoteLooper : public looper::Output
     static constexpr int      kViewSteps      = 15;   // U5: the white keys
     static constexpr int      kFirstKey       = 7;    // Hardware::SwId range of the 25 keys
     static constexpr int      kLastKey        = 31;
+    static constexpr int      kNumKeyIds      = 40;   // U5: engine voice / key ids with an LED
 
     /** U5: what the end black keys will do, for their LEDs. */
     enum class Nav : uint8_t
@@ -93,7 +94,7 @@ class NoteLooper : public looper::Output
         OFF,    // nothing there
         WITHIN, // green: reveal the hidden part of this bar
         PAGE,   // purple: to the next / previous bar
-        ADD,    // red: append a dormant bar (forward only)
+        ADD,    // red: append dormant bars (forward only)
     };
 
     void Init(BaseEngine           **engines,
@@ -133,6 +134,8 @@ class NoteLooper : public looper::Output
         nav_ms_            = 0;
         play_in_view_      = false;
         for(auto &g : view_grid_)
+            g = -1;
+        for(auto &g : key_grid_)
             g = -1;
         edit_ok_ = edit_erase_ = false;
 
@@ -283,7 +286,7 @@ class NoteLooper : public looper::Output
     // U5: the 15 white keys show 15 consecutive steps of the current quantize grid
     // (1/16 when the grid is off), starting at view_start_. The end black keys slide
     // the window: by the hidden part of the current bar (green), to the next or
-    // previous bar (purple), or past the loop's end into a new dormant bar (red).
+    // previous bar (purple), or past the loop's end into new dormant bars (red).
 
     /** Which engine the step view shows (the UI's current engine). */
     void SetViewEngine(uint8_t engine) { view_engine_ = engine > 1 ? 1 : engine; }
@@ -563,16 +566,23 @@ class NoteLooper : public looper::Output
     bool          HasLoop() const { return core_.HasLoop(); }
     bool          IsFull() const { return core_.IsFull(); }
 
+    /** U5: grid of the looped note last started on an engine voice / key id
+     *  (0-39), or -1 if that key was last played by hand. For the key LEDs. */
+    int KeyGrid(int key) const { return key >= 0 && key < kNumKeyIds ? key_grid_[key] : -1; }
+
     // ------------- looper::Output -------------
 
     void LoopNoteOn(const looper::Event &e) override
     {
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        const int     v   = StartVoice(eng, e.key, e.note);
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
-                                                        StartVoice(eng, e.key, e.note),
+                                                        v,
                                                         127.f,
                                                         KeyRequest::Source::SEQUENCER));
+        if(v >= 0 && v < kNumKeyIds)
+            key_grid_[v] = static_cast<int8_t>(e.grid); // U5
         if(!(e.flags & looper::kFlagFromMidi))
             hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOn);
     }
@@ -595,11 +605,14 @@ class NoteLooper : public looper::Output
     void LiveNoteOn(const looper::Event &e) override
     {
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
+        const int     v   = StartVoice(eng, e.key, e.note);
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
-                                                        StartVoice(eng, e.key, e.note),
+                                                        v,
                                                         127.f,
                                                         KeyRequest::Source::USER));
+        if(v >= 0 && v < kNumKeyIds)
+            key_grid_[v] = -1; // U5: played by hand: white
         if(!(e.flags & looper::kFlagFromMidi))
             hw_->queueMidiNote(midi_ch_[eng], e.note, 127, NoteOn);
     }
@@ -723,10 +736,10 @@ class NoteLooper : public looper::Output
             for(int k = kFirstKey; k <= kLastKey; k++)
                 if(hw_->button_sr.State(k))
                     sel |= 1u << k;
-            selected_   = sel;
-            view_tick_  = 0;
-            nav_ms_     = 0;
-            view_start_ = FollowStart(PlayheadUnits());
+            selected_     = sel;
+            view_tick_    = 0;
+            nav_ms_       = 0;
+            view_start_   = FollowStart(PlayheadUnits());
             play_in_view_ = false;
         }
         else
@@ -851,7 +864,7 @@ class NoteLooper : public looper::Output
                 }
                 break;
                 case Nav::PAGE: view_start_ = ((end - 1) / bar + 1) * bar; break;
-               case Nav::ADD:
+                case Nav::ADD:
                 {
                     // U5: enough dormant bars to fill the window, like seeding a new loop
                     const int32_t old_limit = EditLimit();
@@ -999,6 +1012,7 @@ class NoteLooper : public looper::Output
     int             transpose_step_ = 0; // knob steps from 0
     int             knob_turns_     = 0; // detents toward the next step
     int16_t         chroma_voice_[128] = {}; // engine voice used for each Chroma note
+    volatile int8_t key_grid_[kNumKeyIds];   // U5: grid of the note on each key id, -1 = by hand
 
     // CHOMPI key gesture
     bool     chompi_down_;
