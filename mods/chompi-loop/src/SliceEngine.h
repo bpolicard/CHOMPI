@@ -154,19 +154,32 @@ class sliceEngine : public BaseEngine {
         ProcessKeyReqs();
     }
 
+    // LOOPER: a request is for a slice if its key is a slice key, or if it names
+    // its slice outright (transpose_nn = slice + 1). The looper uses key ids above
+    // 31 for a looped slice that no key plays at the current slot window.
+    static bool isSliceRequest(const KeyRequest &req) {
+        if (req.key_ < 0) {
+            return false;
+        }
+        if (req.transpose_nn_ >= 1.f) {
+            return true;
+        }
+        return req.key_ <= 31 && sliceMap[req.key_] != 99;
+    }
+
     void ProcessKeyReqs() {
         while (!request_fifo.IsEmpty())
         {
             KeyRequest req = request_fifo.PopFront();
             
-            if (req.key_ < 0 || req.key_ > 31) {
+            if (!isSliceRequest(req)) {
                 continue;
             }
 
-            if (req.type_ == KeyRequest::Type::START && sliceMap[req.key_] != 99) {
+            if (req.type_ == KeyRequest::Type::START) {
                 StartPlayback(req.transpose_nn_, req.key_, req.vel_, req.src_);
             }
-            else if (req.type_ == KeyRequest::Type::STOP && sliceMap[req.key_] != 99) {
+            else if (req.type_ == KeyRequest::Type::STOP) {
                 StopPlayback(req.key_, req.src_);
             }
         }
@@ -185,8 +198,16 @@ class sliceEngine : public BaseEngine {
     }
 
     int sliceForRequest(float transpose_nn, int key) const {
-        int s = transpose_nn >= 1.f ? static_cast<int>(transpose_nn) - 1
-                                    : static_cast<int>(sliceMap[key]) + slice_offset_;
+        int s;
+        if (transpose_nn >= 1.f) {
+            s = static_cast<int>(transpose_nn) - 1;
+        }
+        else if (key >= 0 && key <= 31 && sliceMap[key] != 99) {
+            s = static_cast<int>(sliceMap[key]) + slice_offset_;
+        }
+        else {
+            s = 0;
+        }
         if (s < 0) s = 0;
         if (s >= static_cast<int>(kMaxSlices)) s = kMaxSlices - 1;
         return s;
@@ -407,7 +428,7 @@ class sliceEngine : public BaseEngine {
 
     bool isKeyPlaying(size_t key) override {
         for (int i = 0; i < NUM_VOICES; ++i) {
-            if (myVoices[i].key == key && myVoices[i].gate_) {
+            if (myVoices[i].key == static_cast<int>(key) && myVoices[i].gate_) {
                 return true;
             }
         }
@@ -562,7 +583,7 @@ class sliceEngine : public BaseEngine {
     void handleRetrigEnv(bool on, size_t key) override {
         size_t idx = 0;
         for (size_t i = 0; i < NUM_VOICES; ++i) {
-            if (myVoices[i].key == key) {
+            if (myVoices[i].key == static_cast<int>(key)) {
                 idx = i;
                 break;
             }

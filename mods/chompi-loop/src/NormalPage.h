@@ -1161,7 +1161,13 @@ namespace chompi
         /** U5: the Slice engine (engines_[SLICE] is a sliceEngine, see chompi_main) */
         sliceEngine *Slice() { return static_cast<sliceEngine *>(engines_[SLICE]); }
         int SliceOffset() { return Slice()->getSliceOffset(); }
-        void SetSliceOffset(int off) { Slice()->setSliceOffset(off); }
+        void SetSliceOffset(int off)
+        {
+            Slice()->setSliceOffset(off);
+            if (looper_) {
+                looper_->SetSliceOffset(off); // so looped notes light the keys that play them now
+            }
+        }
 
         /** U5: the nn a Slice key sends: its slice + 1 at the current window, or 0 for
          *  a key that plays no slice (so the engine ignores it as before). */

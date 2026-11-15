@@ -9,7 +9,9 @@
  *
  *  It also holds the Chroma key transpose (the pitch knob, in fourths and fifths)
  *  and maps every Chroma note to the key that plays that pitch at the current
- *  transpose, so the key LEDs follow the pitches as you transpose.
+ *  transpose, so the key LEDs follow the pitches as you transpose. Slice works the
+ *  same way with its slot window: a looped note lights the key that plays its
+ *  slice now (U5).
  *
  *  And it runs the step view: Play + Loop held for a second switches the keys from
  *  playing notes to showing and editing the loop. The 15 white keys are a window
@@ -41,7 +43,8 @@ namespace looper_ui
 static const int8_t kKeyOrder[25]
     = {15, 7, 8, 12, 9, 10, 13, 11, 14, 16, 21, 17, 18, 22, 19, 23, 20, 24, 29, 25, 30, 26, 31, 27, 28};
 
-/** U5: the 15 white keys left to right, and the 10 black keys left to right. */
+/** U5: the 15 white keys left to right (white key i plays slice i + the slot
+ *  window in Slice), and the 10 black keys left to right. */
 static const int8_t kWhiteKeys[15] = {15, 8, 9, 10, 11, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28};
 static const int8_t kBlackKeys[10] = {7, 12, 13, 14, 21, 22, 23, 29, 30, 31};
 static const int8_t kBlackFirst    = 7;  // leftmost black key: back
@@ -53,6 +56,15 @@ static inline bool IsBlackKey(int id)
         if(kBlackKeys[i] == id)
             return true;
     return false;
+}
+
+/** U5: index of a white key (0-14), or -1. */
+static inline int WhiteIndex(int id)
+{
+    for(int i = 0; i < 15; i++)
+        if(kWhiteKeys[i] == id)
+            return i;
+    return -1;
 }
 } // namespace looper_ui
 
@@ -133,10 +145,13 @@ class NoteLooper : public looper::Output
         nav_fwd_ = nav_back_ = Nav::OFF;
         nav_ms_            = 0;
         play_in_view_      = false;
+        slice_offset_      = 0;
         for(auto &g : view_grid_)
             g = -1;
         for(auto &g : key_grid_)
             g = -1;
+        for(int k = 0; k < 32; k++)
+            slice_voice_[k] = static_cast<int16_t>(k);
         edit_ok_ = edit_erase_ = false;
 
         initialized_ = true;
@@ -193,6 +208,10 @@ class NoteLooper : public looper::Output
         LooperInput in{LooperInput::Type::STEP_NAV, 0, 0, 0, 0, static_cast<int8_t>(dir > 0 ? 1 : -1), false};
         input_fifo_.PushBack(in);
     }
+
+    /** U5: the Slice slot window (0 or 1): key i plays slice i + offset. A looped
+     *  note lights the key that plays its slice at the current window. */
+    void SetSliceOffset(int off) { slice_offset_ = off > 0 ? 1 : 0; }
 
     /** Press + turn the tempo knob: scroll through every grid
      *  (1/4, 1/4T, 1/8, 1/8T, 1/16, 1/16T, 1/32, 1/32T, off). */
@@ -317,13 +336,7 @@ class NoteLooper : public looper::Output
     Nav NavBack() const { return nav_back_; }
 
     /** The step (0-based, in the window) a white key stands for, or -1. */
-    int StepIndexOfKey(int key) const
-    {
-        for(int i = 0; i < kViewSteps; i++)
-            if(looper_ui::kWhiteKeys[i] == key)
-                return i;
-        return -1;
-    }
+    int StepIndexOfKey(int key) const { return looper_ui::WhiteIndex(key); }
 
     /** Keys (bit = Hardware::SwId) whose notes a step press places. Empty = none
      *  were held when the step view opened: the UI picks a random one per press. */
@@ -575,7 +588,7 @@ class NoteLooper : public looper::Output
     void LoopNoteOn(const looper::Event &e) override
     {
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
-        const int     v   = StartVoice(eng, e.key, e.note);
+        const int     v   = StartVoice(eng, e.key, e.nn, e.note);
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
                                                         v,
@@ -605,7 +618,7 @@ class NoteLooper : public looper::Output
     void LiveNoteOn(const looper::Event &e) override
     {
         const uint8_t eng = e.engine > 1 ? 1 : e.engine;
-        const int     v   = StartVoice(eng, e.key, e.note);
+        const int     v   = StartVoice(eng, e.key, e.nn, e.note);
         engines_[eng]->request_fifo.PushBack(KeyRequest(KeyRequest::Type::START,
                                                         static_cast<float>(e.nn),
                                                         v,
@@ -649,13 +662,30 @@ class NoteLooper : public looper::Output
         return semis < 0 ? -s : s;
     }
 
-    /** The engine voice for a note. Slice: the key, as always. Chroma: the key that
-     *  plays this pitch at the current transpose, so its LED lights; a pitch no key
-     *  reaches right now gets a voice id of its own (no LED). */
-    int VoiceForNote(uint8_t engine, int8_t key, uint8_t note) const
+    /** The engine voice for a note: the key that plays it right now, so that key's
+     *  LED lights. Chroma: the key that plays this pitch at the current transpose.
+     *  Slice (U5): the key that plays this slice at the current slot window. A
+     *  pitch / slice no key reaches right now gets a voice id of its own (no LED). */
+    int VoiceForNote(uint8_t engine, int8_t key, int8_t nn, uint8_t note) const
     {
         if(engine != 0)
-            return key;
+        {
+            int slice = -1;
+            if(nn >= 1)
+                slice = nn - 1;
+            else
+            {
+                const int i = looper_ui::WhiteIndex(key);
+                if(i >= 0)
+                    slice = i + slice_offset_;
+            }
+            if(slice < 0)
+                return key; // not a slice key (the engine ignores it)
+            const int i = slice - slice_offset_;
+            if(i >= 0 && i < kViewSteps)
+                return looper_ui::kWhiteKeys[i];
+            return 200 + slice; // off the keyboard right now: unique, no LED
+        }
         const int n = static_cast<int>(note) - transpose_;
         if(n >= kLowestKeyNote && n <= kHighestKeyNote)
             return looper_ui::kKeyOrder[n - kLowestKeyNote];
@@ -663,18 +693,22 @@ class NoteLooper : public looper::Output
     }
 
     /** Pick the voice for a note that starts now, and remember it for its note-off
-     *  (the transpose may change in between). */
-    int StartVoice(uint8_t engine, int8_t key, uint8_t note)
+     *  (the transpose or slot window may change in between). */
+    int StartVoice(uint8_t engine, int8_t key, int8_t nn, uint8_t note)
     {
-        const int v = VoiceForNote(engine, key, note);
+        const int v = VoiceForNote(engine, key, nn, note);
         if(engine == 0)
             chroma_voice_[note & 127] = static_cast<int16_t>(v);
+        else if(key >= 0 && key < 32)
+            slice_voice_[key] = static_cast<int16_t>(v);
         return v;
     }
 
     int VoiceOf(uint8_t engine, int8_t key, uint8_t note) const
     {
-        return engine == 0 ? chroma_voice_[note & 127] : key;
+        if(engine == 0)
+            return chroma_voice_[note & 127];
+        return key >= 0 && key < 32 ? slice_voice_[key] : key;
     }
 
     /** options.json grid value (notes per whole note, 0 = off) -> grid index */
@@ -1013,6 +1047,10 @@ class NoteLooper : public looper::Output
     int             knob_turns_     = 0; // detents toward the next step
     int16_t         chroma_voice_[128] = {}; // engine voice used for each Chroma note
     volatile int8_t key_grid_[kNumKeyIds];   // U5: grid of the note on each key id, -1 = by hand
+
+    // U5: Slice slot window (set from the UI), and the voice each Slice key's note uses
+    volatile int8_t slice_offset_;
+    int16_t         slice_voice_[32];
 
     // CHOMPI key gesture
     bool     chompi_down_;
